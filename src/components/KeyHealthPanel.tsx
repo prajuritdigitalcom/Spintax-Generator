@@ -59,10 +59,17 @@ export default function KeyHealthPanel({ keys, logs, onRefresh, isRefreshing }: 
 
   return (
     <div id="key-health-panel-container" className="bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm mt-6">
-      <button
+      <div
         id="toggle-panel-button"
         onClick={() => setIsOpen(!isOpen)}
-        className="w-full flex items-center justify-between px-5 py-4 bg-slate-50 hover:bg-slate-100/80 transition-colors text-left"
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            setIsOpen(!isOpen);
+          }
+        }}
+        role="button"
+        tabIndex={0}
+        className="w-full flex items-center justify-between px-5 py-4 bg-slate-50 hover:bg-slate-100/80 transition-colors text-left cursor-pointer focus:outline-none"
       >
         <div className="flex items-center gap-2.5">
           <Cpu className="h-5 w-5 text-slate-500" />
@@ -81,14 +88,14 @@ export default function KeyHealthPanel({ keys, logs, onRefresh, isRefreshing }: 
               onRefresh();
             }}
             disabled={isRefreshing}
-            className="p-1.5 rounded-md hover:bg-slate-200 text-slate-500 disabled:opacity-50 transition-colors"
+            className="p-1.5 rounded-md hover:bg-slate-200 text-slate-500 disabled:opacity-50 transition-colors cursor-pointer"
             title="Reload API Keys status"
           >
             <RotateCw className={`h-4 w-4 ${isRefreshing ? "animate-spin text-indigo-600" : ""}`} />
           </button>
           {isOpen ? <ChevronUp className="h-5 w-5 text-slate-400" /> : <ChevronDown className="h-5 w-5 text-slate-400" />}
         </div>
-      </button>
+      </div>
 
       <AnimatePresence>
         {isOpen && (
