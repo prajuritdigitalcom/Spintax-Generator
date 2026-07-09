@@ -1,6 +1,6 @@
 import path from "path";
 import { createServer as createViteServer } from "vite";
-import { app } from "./server-app";
+import app from "./api/index";
 
 const PORT = 3000;
 
