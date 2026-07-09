@@ -1,0 +1,6 @@
+{
+  "name": "AI Contextual Spintax Generator",
+  "description": "An advanced, human-friendly AI Spintax generator that performs contextual paragraph rewriting, keyword preservation, HTML/Markdown protection, and smart variation using Google Gemini API with key rotation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
