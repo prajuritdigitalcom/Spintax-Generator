@@ -289,44 +289,46 @@ export default function App() {
         
         {/* Custom API Key Input Card - Sleek and modern */}
         <div className="mb-8 bg-white border border-slate-200 rounded-2xl shadow-xs p-5">
-          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
-            <div className="flex items-start gap-3">
-              <div className="bg-brand-light text-brand p-2 rounded-xl mt-0.5">
-                <Lock className="h-5 w-5" />
-              </div>
-              <div>
-                <h3 className="font-bold text-slate-900 text-sm md:text-base font-display flex items-center gap-2">
-                  Gunakan API Key Gemini Pribadi Anda (Opsional)
-                  <span className="text-[10px] bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-full font-semibold">Bypass Rotasi Server</span>
-                </h3>
-                <p className="text-xs text-slate-500 mt-1 leading-relaxed">
-                  Jika API Key bawaan website mengalami rate-limit atau error 503, masukkan API Key Anda sendiri di bawah. API Key Anda disimpan dengan aman secara lokal di browser Anda.
-                </p>
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-6">
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-3">
+                <div className="bg-brand-light text-brand p-2 rounded-xl shrink-0">
+                  <Lock className="h-5 w-5" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-slate-900 text-sm md:text-base font-display flex flex-wrap items-center gap-2">
+                    Gunakan API Key Gemini Pribadi (Opsional)
+                    <span className="text-[10px] bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-full font-semibold">Bypass Rotasi Server</span>
+                  </h3>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    Gunakan kunci Anda sendiri jika kuota server habis. Disimpan aman di browser Anda.
+                  </p>
+                </div>
               </div>
             </div>
-            <div className="flex-1 max-w-md w-full">
+            <div className="w-full md:w-[480px] shrink-0">
               <div className="relative">
                 <input
                   type="password"
                   placeholder="Masukkan API Key Gemini Anda (AIzaSy...)"
                   value={customApiKey}
                   onChange={(e) => handleCustomApiKeyChange(e.target.value)}
-                  className="w-full pl-3 pr-10 py-2 bg-slate-50 border border-slate-200 hover:border-slate-300 focus:border-brand focus:bg-white rounded-xl text-xs sm:text-sm font-mono focus:outline-hidden transition-all shadow-inner"
+                  className="w-full pl-4 pr-12 py-3 bg-slate-50 border border-slate-200 hover:border-slate-300 focus:border-brand focus:bg-white rounded-xl text-xs sm:text-sm font-mono focus:outline-hidden transition-all shadow-inner"
                 />
                 {customApiKey ? (
                   <button
                     onClick={() => handleCustomApiKeyChange("")}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-rose-500"
+                    className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 hover:text-rose-500 cursor-pointer"
                     title="Hapus API Key"
                   >
                     <Trash2 className="h-4 w-4" />
                   </button>
                 ) : (
-                  <Lock className="absolute right-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-300 pointer-events-none" />
+                  <Lock className="absolute right-4 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-300 pointer-events-none" />
                 )}
               </div>
               {customApiKey && (
-                <p className="text-[10px] text-emerald-600 font-semibold mt-1.5 flex items-center gap-1">
+                <p className="text-[10px] text-emerald-600 font-semibold mt-1.5 flex items-center gap-1 pl-1">
                   <Check className="h-3 w-3" /> Menggunakan API Key Pribadi Anda untuk request berikutnya!
                 </p>
               )}
