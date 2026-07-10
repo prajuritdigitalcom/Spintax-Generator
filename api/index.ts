@@ -159,8 +159,90 @@ function resolveSpintax(text: string, index: number): string {
 async function generateSpintaxWithFailover(
   paragraphText: string,
   protectedKeywords: string[],
-  fileType: string
+  fileType: string,
+  customApiKey?: string
 ): Promise<{ spintaxText: string; debugLogs: any[] }> {
+  // If a custom API key is provided, bypass failover and use it directly
+  if (customApiKey && customApiKey.trim().length > 0) {
+    const startTime = Date.now();
+    const model = process.env.GEMINI_MODEL || "gemini-3.5-flash";
+    const keywordsString = protectedKeywords.length > 0 ? protectedKeywords.join(", ") : "None";
+    const debugLogs: any[] = [];
+
+    try {
+      const ai = new GoogleGenAI({
+        apiKey: customApiKey.trim(),
+        httpOptions: {
+          headers: {
+            "User-Agent": "aistudio-build",
+          },
+        },
+      });
+
+      const prompt = `You are an expert SEO Content Writer and AI Spintax Specialist.
+Your task is to convert the provided paragraph of text into high-quality, human-friendly Contextual Spintax.
+
+### Core Rules:
+1. FORMAT: Use the standard spintax format \`{variation1|variation2|...}\`. Do not nested-spin unless absolutely necessary.
+2. CONTEXTUAL REWRITE: Do NOT perform simple word-by-word synonym replacement. Rewrite complete sentences or logical phrases so the output reads naturally, flows elegantly, and is highly engaging for humans.
+3. SMART VARIATION: Automatically decide the number of variations:
+   - Simple sentences: 2 variations.
+   - Medium-complexity sentences: 3 variations.
+   - High-complexity sentences: 4 variations.
+   - Prioritize readability and quality. If generating too many variations makes it sound robotic or unnatural, reduce the number of variations.
+4. PRESERVE MEANING: Keep the original meaning, facts, names, numbers, and important information exactly. Do not add or remove facts, or change context.
+5. KEYWORD PROTECTION:
+   The following keywords are strictly protected: [${keywordsString}]
+   These protected keywords MUST remain exactly as-is. Do NOT translate them, do NOT replace them with synonyms, do NOT change their spelling, casing, or word order.
+6. HTML/MARKDOWN PROTECTION (Input Type: ${fileType}):
+   - If the input contains HTML tags (e.g. <h1>, <strong>, <a>, <img ...>, etc.) or Markdown syntax (e.g. #, **, *, [text](url), etc.), you MUST preserve all tags, attributes, and syntax symbols exactly.
+   - Only spin the text inside the HTML elements or Markdown structures. Do NOT spin or alter the tag tags themselves, tag attributes (like href, src, etc.), or Markdown syntax symbols.
+7. PARAGRAPH STRUCTURE: Return the entire paragraph with the spintax embedded, keeping the original paragraph structure intact. Do not add extra comments, markdown formatting around the output, or explanations. Only return the processed text.
+
+Input Paragraph:
+"""
+${paragraphText}
+"""`;
+
+      const response = await ai.models.generateContent({
+        model: model,
+        contents: prompt,
+      });
+
+      const spintaxText = response.text || "";
+      const duration = Date.now() - startTime;
+
+      debugLogs.push({
+        time: new Date().toISOString(),
+        apiKeyName: "KUNCI_API_PRIBADI",
+        maskedKey: `${customApiKey.trim().slice(0, 4)}...${customApiKey.trim().slice(-4)}`,
+        model,
+        durationMs: duration,
+        status: "Success",
+        attempt: 1,
+      });
+
+      return {
+        spintaxText: spintaxText.trim(),
+        debugLogs,
+      };
+    } catch (err: any) {
+      const duration = Date.now() - startTime;
+      const errMsg = err.message || "Unknown Gemini API Error";
+      debugLogs.push({
+        time: new Date().toISOString(),
+        apiKeyName: "KUNCI_API_PRIBADI",
+        maskedKey: `${customApiKey.trim().slice(0, 4)}...${customApiKey.trim().slice(-4)}`,
+        model,
+        durationMs: duration,
+        status: "Failed",
+        error: errMsg,
+        attempt: 1,
+      });
+      throw new Error(`Kunci API Pribadi Anda gagal: ${errMsg}`);
+    }
+  }
+
   const maxAttempts = Math.min(4, Math.max(3, apiKeys.length));
   let attempt = 0;
   const debugLogs: any[] = [];
@@ -307,7 +389,11 @@ app.post("/api/keys-refresh", (req, res) => {
 
 // Main Generation API Endpoint
 app.post("/api/generate-spintax", async (req, res) => {
-  const { text, keywords = [], fileType = "text" } = req.body;
+  const { text, keywords = [], fileType = "text", customApiKey } = req.body;
+
+  const resolvedCustomKey = (typeof customApiKey === "string" && customApiKey.trim().length > 0)
+    ? customApiKey.trim()
+    : (req.headers["x-custom-api-key"] as string || "").trim();
 
   if (!text || typeof text !== "string") {
     return res.status(400).json({ error: "Input text is required" });
@@ -339,7 +425,7 @@ app.post("/api/generate-spintax", async (req, res) => {
         }
         
         try {
-          const result = await generateSpintaxWithFailover(paragraph, formattedKeywords, fileType);
+          const result = await generateSpintaxWithFailover(paragraph, formattedKeywords, fileType, resolvedCustomKey);
           return result;
         } catch (err: any) {
           console.error(`Paragraph ${index} failed:`, err);

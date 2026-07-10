@@ -30,6 +30,16 @@ const SAMPLES: Record<FileType, string> = {
 };
 
 export default function App() {
+  // Custom API Key state
+  const [customApiKey, setCustomApiKey] = useState(() => {
+    return localStorage.getItem("custom_gemini_api_key") || "";
+  });
+
+  const handleCustomApiKeyChange = (val: string) => {
+    setCustomApiKey(val);
+    localStorage.setItem("custom_gemini_api_key", val);
+  };
+
   // Input states
   const [inputText, setInputText] = useState("");
   const [fileType, setFileType] = useState<FileType>("text");
@@ -143,6 +153,7 @@ export default function App() {
           text: inputText,
           keywords: protectedKeywords,
           fileType: fileType,
+          customApiKey: customApiKey,
         }),
       });
 
@@ -241,10 +252,10 @@ export default function App() {
   return (
     <div id="main-container" className="min-h-screen bg-slate-50/50 text-slate-800 font-sans selection:bg-brand-light selection:text-brand pb-12">
       {/* Dynamic Alert Banner if API Keys are missing */}
-      {keysHealth.length === 0 && !isRefreshingKeys && (
+      {keysHealth.length === 0 && !customApiKey && !isRefreshingKeys && (
         <div id="no-api-key-banner" className="bg-amber-500 text-white px-4 py-2.5 text-center text-sm font-medium flex items-center justify-center gap-2 shadow-sm">
           <AlertCircle className="h-4 w-4 shrink-0" />
-          <span>No Gemini API Keys configured. Please add keys to continue. Go to <b>Settings &gt; Secrets</b> to declare <code className="bg-amber-600/50 px-1.5 py-0.5 rounded font-mono text-xs text-white">GEMINI_API_KEY</code>.</span>
+          <span>No Gemini API Keys configured. Please add keys to continue. Go to <b>Settings &gt; Secrets</b> to declare <code className="bg-amber-600/50 px-1.5 py-0.5 rounded font-mono text-xs text-white">GEMINI_API_KEY</code> or input your own API Key below.</span>
         </div>
       )}
 
@@ -275,6 +286,54 @@ export default function App() {
 
       {/* Main content grid */}
       <main id="app-main-content" className="max-w-7xl mx-auto px-4 sm:px-6 mt-8">
+        
+        {/* Custom API Key Input Card - Sleek and modern */}
+        <div className="mb-8 bg-white border border-slate-200 rounded-2xl shadow-xs p-5">
+          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+            <div className="flex items-start gap-3">
+              <div className="bg-brand-light text-brand p-2 rounded-xl mt-0.5">
+                <Lock className="h-5 w-5" />
+              </div>
+              <div>
+                <h3 className="font-bold text-slate-900 text-sm md:text-base font-display flex items-center gap-2">
+                  Gunakan API Key Gemini Pribadi Anda (Opsional)
+                  <span className="text-[10px] bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-full font-semibold">Bypass Rotasi Server</span>
+                </h3>
+                <p className="text-xs text-slate-500 mt-1 leading-relaxed">
+                  Jika API Key bawaan website mengalami rate-limit atau error 503, masukkan API Key Anda sendiri di bawah. API Key Anda disimpan dengan aman secara lokal di browser Anda.
+                </p>
+              </div>
+            </div>
+            <div className="flex-1 max-w-md w-full">
+              <div className="relative">
+                <input
+                  type="password"
+                  placeholder="Masukkan API Key Gemini Anda (AIzaSy...)"
+                  value={customApiKey}
+                  onChange={(e) => handleCustomApiKeyChange(e.target.value)}
+                  className="w-full pl-3 pr-10 py-2 bg-slate-50 border border-slate-200 hover:border-slate-300 focus:border-brand focus:bg-white rounded-xl text-xs sm:text-sm font-mono focus:outline-hidden transition-all shadow-inner"
+                />
+                {customApiKey ? (
+                  <button
+                    onClick={() => handleCustomApiKeyChange("")}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-rose-500"
+                    title="Hapus API Key"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </button>
+                ) : (
+                  <Lock className="absolute right-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-300 pointer-events-none" />
+                )}
+              </div>
+              {customApiKey && (
+                <p className="text-[10px] text-emerald-600 font-semibold mt-1.5 flex items-center gap-1">
+                  <Check className="h-3 w-3" /> Menggunakan API Key Pribadi Anda untuk request berikutnya!
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
+
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
           
           {/* LEFT PANEL - INPUT ARTIKEL */}
