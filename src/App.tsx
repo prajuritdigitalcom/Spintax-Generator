@@ -30,14 +30,53 @@ const SAMPLES: Record<FileType, string> = {
 };
 
 export default function App() {
-  // Custom API Key state
-  const [customApiKey, setCustomApiKey] = useState(() => {
-    return localStorage.getItem("custom_gemini_api_key") || "";
+  // Custom API Keys state
+  const [customApiKeys, setCustomApiKeys] = useState<string[]>(() => {
+    try {
+      const stored = localStorage.getItem("custom_gemini_api_keys");
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (Array.isArray(parsed)) {
+          return parsed.map(k => String(k).trim()).filter(Boolean);
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+    const single = localStorage.getItem("custom_gemini_api_key") || "";
+    return single ? [single.trim()] : [];
   });
 
-  const handleCustomApiKeyChange = (val: string) => {
-    setCustomApiKey(val);
-    localStorage.setItem("custom_gemini_api_key", val);
+  const [newKeyInput, setNewKeyInput] = useState("");
+
+  const handleAddKey = (keyString: string) => {
+    if (!keyString.trim()) return;
+    // Support pasting multiple keys split by comma, semicolon, space, or newline
+    const keysToAdd = keyString
+      .split(/[\s,;\n\r]+/)
+      .map(k => k.trim())
+      .filter(k => k.length > 0 && !customApiKeys.includes(k));
+
+    if (keysToAdd.length > 0) {
+      const updated = [...customApiKeys, ...keysToAdd];
+      setCustomApiKeys(updated);
+      localStorage.setItem("custom_gemini_api_keys", JSON.stringify(updated));
+      localStorage.setItem("custom_gemini_api_key", updated[0] || "");
+    }
+    setNewKeyInput("");
+  };
+
+  const handleRemoveKey = (indexToRemove: number) => {
+    const updated = customApiKeys.filter((_, idx) => idx !== indexToRemove);
+    setCustomApiKeys(updated);
+    localStorage.setItem("custom_gemini_api_keys", JSON.stringify(updated));
+    localStorage.setItem("custom_gemini_api_key", updated[0] || "");
+  };
+
+  const handleClearAllKeys = () => {
+    setCustomApiKeys([]);
+    localStorage.removeItem("custom_gemini_api_keys");
+    localStorage.removeItem("custom_gemini_api_key");
   };
 
   // Input states
@@ -153,7 +192,7 @@ export default function App() {
           text: inputText,
           keywords: protectedKeywords,
           fileType: fileType,
-          customApiKey: customApiKey,
+          customApiKeys: customApiKeys,
         }),
       });
 
@@ -252,7 +291,7 @@ export default function App() {
   return (
     <div id="main-container" className="min-h-screen bg-slate-50/50 text-slate-800 font-sans selection:bg-brand-light selection:text-brand pb-12">
       {/* Dynamic Alert Banner if API Keys are missing */}
-      {keysHealth.length === 0 && !customApiKey && !isRefreshingKeys && (
+      {keysHealth.length === 0 && customApiKeys.length === 0 && !isRefreshingKeys && (
         <div id="no-api-key-banner" className="bg-amber-500 text-white px-4 py-2.5 text-center text-sm font-medium flex items-center justify-center gap-2 shadow-sm">
           <AlertCircle className="h-4 w-4 shrink-0" />
           <span>No Gemini API Keys configured. Please add keys to continue. Go to <b>Settings &gt; Secrets</b> to declare <code className="bg-amber-600/50 px-1.5 py-0.5 rounded font-mono text-xs text-white">GEMINI_API_KEY</code> or input your own API Key below.</span>
@@ -287,51 +326,104 @@ export default function App() {
       {/* Main content grid */}
       <main id="app-main-content" className="max-w-7xl mx-auto px-4 sm:px-6 mt-8">
         
-        {/* Custom API Key Input Card - Sleek and modern */}
+        {/* Custom API Key Input Card - Sleek and modern multi-key manager */}
         <div className="mb-8 bg-white border border-slate-200 rounded-2xl shadow-xs p-5">
-          <div className="flex flex-col md:flex-row md:items-center justify-between gap-6">
-            <div className="flex-1 min-w-0">
+          <div className="flex flex-col gap-5">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-slate-100 pb-4">
               <div className="flex items-center gap-3">
                 <div className="bg-brand-light text-brand p-2 rounded-xl shrink-0">
                   <Lock className="h-5 w-5" />
                 </div>
                 <div>
                   <h3 className="font-bold text-slate-900 text-sm md:text-base font-display flex flex-wrap items-center gap-2">
-                    Gunakan API Key Gemini Pribadi (Opsional)
-                    <span className="text-[10px] bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-full font-semibold">Bypass Rotasi Server</span>
+                    Kunci API Gemini Pribadi Anda ({customApiKeys.length})
+                    <span className="text-[10px] bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-full font-semibold">Bypass &amp; Rotasi Otomatis</span>
                   </h3>
                   <p className="text-xs text-slate-500 mt-0.5">
-                    Gunakan kunci Anda sendiri jika kuota server habis. Disimpan aman di browser Anda.
+                    Masukkan satu atau beberapa kunci API Anda sendiri. Sistem akan merotasi secara bergantian saat permintaan spintax diproses.
                   </p>
                 </div>
               </div>
+              {customApiKeys.length > 0 && (
+                <button
+                  onClick={handleClearAllKeys}
+                  className="text-xs text-rose-500 hover:text-rose-600 font-medium hover:underline flex items-center gap-1 cursor-pointer"
+                >
+                  <Trash2 className="h-3.5 w-3.5" /> Hapus Semua Kunci
+                </button>
+              )}
             </div>
-            <div className="w-full md:w-[480px] shrink-0">
-              <div className="relative">
-                <input
-                  type="password"
-                  placeholder="Masukkan API Key Gemini Anda (AIzaSy...)"
-                  value={customApiKey}
-                  onChange={(e) => handleCustomApiKeyChange(e.target.value)}
-                  className="w-full pl-4 pr-12 py-3 bg-slate-50 border border-slate-200 hover:border-slate-300 focus:border-brand focus:bg-white rounded-xl text-xs sm:text-sm font-mono focus:outline-hidden transition-all shadow-inner"
-                />
-                {customApiKey ? (
-                  <button
-                    onClick={() => handleCustomApiKeyChange("")}
-                    className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 hover:text-rose-500 cursor-pointer"
-                    title="Hapus API Key"
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </button>
-                ) : (
+
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+              {/* Left Column: Key Adder */}
+              <div className="lg:col-span-5 flex flex-col gap-3">
+                <div className="relative">
+                  <input
+                    type="password"
+                    placeholder="Masukkan API Key Gemini Anda (AIzaSy...)"
+                    value={newKeyInput}
+                    onChange={(e) => setNewKeyInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        handleAddKey(newKeyInput);
+                      }
+                    }}
+                    className="w-full pl-4 pr-12 py-3 bg-slate-50 border border-slate-200 hover:border-slate-300 focus:border-brand focus:bg-white rounded-xl text-xs sm:text-sm font-mono focus:outline-hidden transition-all shadow-inner"
+                  />
                   <Lock className="absolute right-4 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-300 pointer-events-none" />
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-[10px] text-slate-400">
+                    * Tips: Bisa paste banyak kunci sekaligus (dipisah koma/baris baru).
+                  </p>
+                  <button
+                    onClick={() => handleAddKey(newKeyInput)}
+                    disabled={!newKeyInput.trim()}
+                    className="shrink-0 bg-brand hover:bg-brand-dark disabled:bg-slate-100 disabled:text-slate-400 text-white text-xs font-semibold px-4 py-2 rounded-lg transition-colors cursor-pointer flex items-center gap-1 shadow-sm"
+                  >
+                    <Plus className="h-3.5 w-3.5" /> Tambahkan
+                  </button>
+                </div>
+              </div>
+
+              {/* Right Column: Key List */}
+              <div className="lg:col-span-7">
+                {customApiKeys.length === 0 ? (
+                  <div className="border border-dashed border-slate-200 bg-slate-50/50 rounded-xl p-6 text-center">
+                    <p className="text-xs text-slate-400 font-medium font-display">Belum ada Kunci API pribadi yang ditambahkan.</p>
+                    <p className="text-[10px] text-slate-400 mt-0.5">Permintaan Anda akan menggunakan rotasi server bawaan.</p>
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap gap-2 max-h-[140px] overflow-y-auto pr-1">
+                    {customApiKeys.map((key, idx) => (
+                      <div 
+                        key={idx} 
+                        className="flex items-center gap-2 bg-slate-50 border border-slate-200/80 rounded-xl px-3 py-1.5 text-xs font-mono shadow-2xs hover:bg-slate-100/80 transition-all group"
+                      >
+                        <span className="text-[10px] bg-slate-200 text-slate-700 w-4 h-4 flex items-center justify-center rounded-full font-bold">
+                          {idx + 1}
+                        </span>
+                        <span className="text-slate-600 font-semibold">
+                          {key.slice(0, 4)}...{key.slice(-4)}
+                        </span>
+                        <button
+                          onClick={() => handleRemoveKey(idx)}
+                          className="text-slate-400 hover:text-rose-500 p-0.5 rounded-md hover:bg-slate-200/50 transition-colors cursor-pointer"
+                          title="Hapus Kunci Ini"
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {customApiKeys.length > 0 && (
+                  <p className="text-[10px] text-emerald-600 font-semibold mt-3 flex items-center gap-1 pl-1">
+                    <Check className="h-3 w-3" /> Menggunakan {customApiKeys.length} Kunci API Pribadi secara bergantian untuk request berikutnya!
+                  </p>
                 )}
               </div>
-              {customApiKey && (
-                <p className="text-[10px] text-emerald-600 font-semibold mt-1.5 flex items-center gap-1 pl-1">
-                  <Check className="h-3 w-3" /> Menggunakan API Key Pribadi Anda untuk request berikutnya!
-                </p>
-              )}
             </div>
           </div>
         </div>

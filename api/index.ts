@@ -160,26 +160,34 @@ async function generateSpintaxWithFailover(
   paragraphText: string,
   protectedKeywords: string[],
   fileType: string,
-  customApiKey?: string
+  customApiKeys?: string[]
 ): Promise<{ spintaxText: string; debugLogs: any[] }> {
-  // If a custom API key is provided, bypass failover and use it directly
-  if (customApiKey && customApiKey.trim().length > 0) {
-    const startTime = Date.now();
-    const model = process.env.GEMINI_MODEL || "gemini-3.5-flash";
-    const keywordsString = protectedKeywords.length > 0 ? protectedKeywords.join(", ") : "None";
-    const debugLogs: any[] = [];
+  // If custom API keys are provided, perform rotation/failover among them
+  if (customApiKeys && customApiKeys.length > 0) {
+    const activeKeys = customApiKeys.map(k => k.trim()).filter(k => k.length > 0);
+    if (activeKeys.length > 0) {
+      let attempt = 0;
+      const maxAttempts = activeKeys.length;
+      const debugLogs: any[] = [];
+      const model = process.env.GEMINI_MODEL || "gemini-3.5-flash";
+      const keywordsString = protectedKeywords.length > 0 ? protectedKeywords.join(", ") : "None";
 
-    try {
-      const ai = new GoogleGenAI({
-        apiKey: customApiKey.trim(),
-        httpOptions: {
-          headers: {
-            "User-Agent": "aistudio-build",
-          },
-        },
-      });
+      while (attempt < maxAttempts) {
+        const currentKey = activeKeys[attempt];
+        const maskedKey = `${currentKey.slice(0, 4)}...${currentKey.slice(-4)}`;
+        const startTime = Date.now();
 
-      const prompt = `You are an expert SEO Content Writer and AI Spintax Specialist.
+        try {
+          const ai = new GoogleGenAI({
+            apiKey: currentKey,
+            httpOptions: {
+              headers: {
+                "User-Agent": "aistudio-build",
+              },
+            },
+          });
+
+          const prompt = `You are an expert SEO Content Writer and AI Spintax Specialist.
 Your task is to convert the provided paragraph of text into high-quality, human-friendly Contextual Spintax.
 
 ### Core Rules:
@@ -204,42 +212,46 @@ Input Paragraph:
 ${paragraphText}
 """`;
 
-      const response = await ai.models.generateContent({
-        model: model,
-        contents: prompt,
-      });
+          const response = await ai.models.generateContent({
+            model: model,
+            contents: prompt,
+          });
 
-      const spintaxText = response.text || "";
-      const duration = Date.now() - startTime;
+          const spintaxText = response.text || "";
+          const duration = Date.now() - startTime;
 
-      debugLogs.push({
-        time: new Date().toISOString(),
-        apiKeyName: "KUNCI_API_PRIBADI",
-        maskedKey: `${customApiKey.trim().slice(0, 4)}...${customApiKey.trim().slice(-4)}`,
-        model,
-        durationMs: duration,
-        status: "Success",
-        attempt: 1,
-      });
+          debugLogs.push({
+            time: new Date().toISOString(),
+            apiKeyName: `KUNCI_PRIBADI_${attempt + 1}`,
+            maskedKey,
+            model,
+            durationMs: duration,
+            status: "Success",
+            attempt: attempt + 1,
+          });
 
-      return {
-        spintaxText: spintaxText.trim(),
-        debugLogs,
-      };
-    } catch (err: any) {
-      const duration = Date.now() - startTime;
-      const errMsg = err.message || "Unknown Gemini API Error";
-      debugLogs.push({
-        time: new Date().toISOString(),
-        apiKeyName: "KUNCI_API_PRIBADI",
-        maskedKey: `${customApiKey.trim().slice(0, 4)}...${customApiKey.trim().slice(-4)}`,
-        model,
-        durationMs: duration,
-        status: "Failed",
-        error: errMsg,
-        attempt: 1,
-      });
-      throw new Error(`Kunci API Pribadi Anda gagal: ${errMsg}`);
+          return {
+            spintaxText: spintaxText.trim(),
+            debugLogs,
+          };
+        } catch (err: any) {
+          const duration = Date.now() - startTime;
+          const errMsg = err.message || "Unknown Gemini API Error";
+          debugLogs.push({
+            time: new Date().toISOString(),
+            apiKeyName: `KUNCI_PRIBADI_${attempt + 1}`,
+            maskedKey,
+            model,
+            durationMs: duration,
+            status: "Failover",
+            error: errMsg,
+            attempt: attempt + 1,
+          });
+          console.warn(`Private API Key index ${attempt} failed (Attempt ${attempt + 1}). Error: ${errMsg}. Trying next private key.`);
+          attempt++;
+        }
+      }
+      throw new Error(`Semua ${maxAttempts} Kunci API Pribadi Anda gagal atau terkena rate limit.`);
     }
   }
 
@@ -389,11 +401,26 @@ app.post("/api/keys-refresh", (req, res) => {
 
 // Main Generation API Endpoint
 app.post("/api/generate-spintax", async (req, res) => {
-  const { text, keywords = [], fileType = "text", customApiKey } = req.body;
+  const { text, keywords = [], fileType = "text", customApiKey, customApiKeys } = req.body;
 
-  const resolvedCustomKey = (typeof customApiKey === "string" && customApiKey.trim().length > 0)
-    ? customApiKey.trim()
-    : (req.headers["x-custom-api-key"] as string || "").trim();
+  let resolvedCustomKeys: string[] = [];
+
+  // Parse customApiKeys array if provided
+  if (Array.isArray(customApiKeys)) {
+    resolvedCustomKeys = customApiKeys.map(k => String(k).trim()).filter(k => k.length > 0);
+  } else {
+    // Fallback to checking customApiKey string (supporting comma/newline split) or header
+    const rawKeyInput = (typeof customApiKey === "string" && customApiKey.trim().length > 0)
+      ? customApiKey.trim()
+      : (req.headers["x-custom-api-key"] as string || "").trim();
+
+    if (rawKeyInput) {
+      resolvedCustomKeys = rawKeyInput
+        .split(/[\s,;\n\r]+/)
+        .map(k => k.trim())
+        .filter(k => k.length > 0);
+    }
+  }
 
   if (!text || typeof text !== "string") {
     return res.status(400).json({ error: "Input text is required" });
@@ -425,7 +452,7 @@ app.post("/api/generate-spintax", async (req, res) => {
         }
         
         try {
-          const result = await generateSpintaxWithFailover(paragraph, formattedKeywords, fileType, resolvedCustomKey);
+          const result = await generateSpintaxWithFailover(paragraph, formattedKeywords, fileType, resolvedCustomKeys);
           return result;
         } catch (err: any) {
           console.error(`Paragraph ${index} failed:`, err);
