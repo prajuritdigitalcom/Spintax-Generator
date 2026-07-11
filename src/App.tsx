@@ -289,7 +289,7 @@ export default function App() {
   };
 
   return (
-    <div id="main-container" className="min-h-screen bg-slate-50/50 text-slate-800 font-sans selection:bg-brand-light selection:text-brand pb-12">
+    <div id="main-container" className="min-h-screen bg-slate-50/50 text-slate-800 font-sans selection:bg-brand-light selection:text-brand">
       {/* Dynamic Alert Banner if API Keys are missing */}
       {keysHealth.length === 0 && customApiKeys.length === 0 && !isRefreshingKeys && (
         <div id="no-api-key-banner" className="bg-amber-500 text-white px-4 py-2.5 text-center text-sm font-medium flex items-center justify-center gap-2 shadow-sm">
@@ -774,6 +774,13 @@ export default function App() {
           isRefreshing={isRefreshingKeys}
         />
       </main>
+
+      {/* Simple Footer */}
+      <footer id="app-footer" className="mt-12 py-5 border-t border-slate-200/60 text-center">
+        <p className="text-xs text-slate-400">
+          &copy; {new Date().getFullYear()} Karya Prajurit Digital. Hak Cipta Dilindungi.
+        </p>
+      </footer>
     </div>
   );
 }
