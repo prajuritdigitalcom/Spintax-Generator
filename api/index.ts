@@ -1,6 +1,6 @@
 import express from "express";
 import dotenv from "dotenv";
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 
 // Load environment variables
 dotenv.config();
@@ -130,10 +130,11 @@ function markKeyCooldown(info: ApiKeyInfo, errMessage: string) {
 // ==========================================
 // Spintax Helper: Parser/Resolver for Previews
 // ==========================================
-function resolveSpintax(text: string, index: number): string {
+function resolveSpintax(text: string, previewNum: number): string {
   let resolved = text;
   const maxIterations = 500;
   let iteration = 0;
+  let blockCounter = 0;
 
   while (iteration < maxIterations) {
     const match = resolved.match(/\{([^{}]+)\}/);
@@ -142,15 +143,152 @@ function resolveSpintax(text: string, index: number): string {
     const fullMatch = match[0];
     const options = match[1].split("|");
 
-    // Pick option deterministically using a combination of the index and pseudo-random choice
-    // to ensure Preview 1, 2, and 3 are distinct but repeatable/diverse
-    const chosenIndex = (index + Math.floor(Math.random() * options.length)) % options.length;
-    const replacement = options[chosenIndex] || "";
+    // Pick option deterministically based on previewNum (1, 2, 3) and block occurrence counter
+    // Ensures Preview 1, 2, and 3 are distinct whenever options >= 3
+    const chosenIndex = (previewNum - 1 + blockCounter) % options.length;
+    const replacement = options[chosenIndex] || options[0] || "";
     resolved = resolved.replace(fullMatch, replacement);
+    blockCounter++;
     iteration++;
   }
 
   return resolved;
+}
+
+// ==========================================
+// System Instruction & Validation Helpers
+// ==========================================
+
+// Single prompt source for spintax rules
+function buildSystemInstruction(protectedKeywords: string[], fileType: string): string {
+  const keywordsString = protectedKeywords.length > 0 ? protectedKeywords.join(", ") : "None";
+  return `You are an expert SEO Content Writer and AI Spintax Specialist.
+Your task is to convert the provided paragraph of text into high-quality, human-friendly Contextual Spintax.
+
+### Core Rules:
+1. FORMAT: Use the standard spintax format \`{variation1|variation2|...}\`. Never produce nested spintax (a \`{...}\` block inside another \`{...}\` block). Each spintax block must contain plain text options only.
+2. CONTEXTUAL REWRITE: Do NOT perform simple word-by-word synonym replacement. Rewrite complete sentences or logical phrases so the output reads naturally, flows elegantly, and is highly engaging for humans.
+3. SMART VARIATION: Automatically decide the number of variations:
+   - Simple sentences: 2 variations.
+   - Medium-complexity sentences: 3 variations.
+   - High-complexity sentences: 4 variations.
+   - Prioritize readability and quality. If generating too many variations makes it sound robotic or unnatural, reduce the number of variations.
+4. PRESERVE MEANING: Keep the original meaning, facts, names, numbers, and important information exactly. Do not add or remove facts, or change context.
+5. KEYWORD PROTECTION:
+   The following keywords are strictly protected: [${keywordsString}]
+   These protected keywords MUST remain exactly as-is. Do NOT translate them, do NOT replace them with synonyms, do NOT change their spelling, casing, or word order.
+6. HTML/MARKDOWN PROTECTION (Input Type: ${fileType}):
+   - If the input contains HTML tags (e.g. <h1>, <strong>, <a>, <img ...>, etc.) or Markdown syntax (e.g. #, **, *, [text](url), etc.), you MUST preserve all tags, attributes, and syntax symbols exactly.
+   - Only spin the text inside the HTML elements or Markdown structures. Do NOT spin or alter the tag tags themselves, tag attributes (like href, src, etc.), or Markdown syntax symbols.
+7. PARAGRAPH STRUCTURE: Return the entire paragraph with the spintax embedded, keeping the original paragraph structure intact. Do not add extra comments, markdown formatting around the output, or explanations. Only return the processed text.`;
+}
+
+// Lightweight post-generation validation
+function validateSpintaxOutput(
+  original: string,
+  output: string,
+  protectedKeywords: string[],
+  fileType: string
+): { ok: boolean; issues: string[] } {
+  const issues: string[] = [];
+
+  // Check protected keywords presence
+  for (const kw of protectedKeywords) {
+    if (kw.trim().length > 0) {
+      if (!output.includes(kw)) {
+        issues.push(`Kata kunci terproteksi "${kw}" tidak ditemukan pada hasil spintax.`);
+      }
+    }
+  }
+
+  // Check HTML tags preservation
+  if (fileType === "html") {
+    const htmlTagRegex = /<[a-zA-Z][^>]*>/g;
+    const origTags = (original.match(htmlTagRegex) || []).length;
+    const outTags = (output.match(htmlTagRegex) || []).length;
+
+    if (origTags > 0 && outTags < origTags) {
+      const dropRatio = (origTags - outTags) / origTags;
+      if (dropRatio > 0.1 || (origTags - outTags) >= 2) {
+        issues.push(`Jumlah tag HTML berkurang dari ${origTags} menjadi ${outTags}.`);
+      }
+    }
+  }
+
+  return {
+    ok: issues.length === 0,
+    issues,
+  };
+}
+
+// Smart Chunking Helper
+function splitParagraphs(text: string, fileType: string): string[] {
+  // 1. Initial split by double newlines
+  const initialChunks = text
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
+
+  const refinedChunks: string[] = [];
+
+  for (const chunk of initialChunks) {
+    if (fileType === "html") {
+      // Split by top-level HTML block element boundaries if multiple exist
+      const blockTagRegex = /<\/(?:p|h[1-6]|li|div|section|article|header|footer|aside|blockquote)>/gi;
+      const matches = Array.from(chunk.matchAll(blockTagRegex));
+
+      if (matches.length > 1) {
+        let lastIndex = 0;
+        for (let i = 0; i < matches.length; i++) {
+          const matchEnd = matches[i].index! + matches[i][0].length;
+          const subBlock = chunk.slice(lastIndex, matchEnd).trim();
+          if (subBlock.length > 0) {
+            refinedChunks.push(subBlock);
+          }
+          lastIndex = matchEnd;
+        }
+        const remaining = chunk.slice(lastIndex).trim();
+        if (remaining.length > 0) {
+          refinedChunks.push(remaining);
+        }
+      } else {
+        refinedChunks.push(chunk);
+      }
+    } else {
+      refinedChunks.push(chunk);
+    }
+  }
+
+  // 2. Enforce hard max length limit per chunk (~6000 chars)
+  const finalChunks: string[] = [];
+  const MAX_CHUNK_LEN = 6000;
+
+  for (const chunk of refinedChunks) {
+    if (chunk.length <= MAX_CHUNK_LEN) {
+      finalChunks.push(chunk);
+    } else {
+      // Split long chunk by sentence endings or linebreaks
+      const sentences = chunk
+        .split(/(?<=\. |\n|<\/p>|<\/div>)/)
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+
+      let currentSub = "";
+      for (const sentence of sentences) {
+        if ((currentSub + " " + sentence).length > MAX_CHUNK_LEN && currentSub.length > 0) {
+          finalChunks.push(currentSub.trim());
+          currentSub = sentence;
+        } else {
+          currentSub = currentSub ? currentSub + " " + sentence : sentence;
+        }
+      }
+      if (currentSub.trim().length > 0) {
+        finalChunks.push(currentSub.trim());
+      }
+    }
+  }
+
+  return finalChunks;
 }
 
 // ==========================================
@@ -160,20 +298,24 @@ async function generateSpintaxWithFailover(
   paragraphText: string,
   protectedKeywords: string[],
   fileType: string,
-  customApiKeys?: string[]
-): Promise<{ spintaxText: string; debugLogs: any[] }> {
-  // If custom API keys are provided, perform rotation/failover among them
+  customApiKeys?: string[],
+  initialKeyIndex = 0
+): Promise<{ spintaxText: string; debugLogs: any[]; validationIssues: string[] }> {
+  // Use "gemini-flash-latest" as the resilient model default
+  const model = process.env.GEMINI_MODEL || "gemini-flash-latest";
+  const systemInstruction = buildSystemInstruction(protectedKeywords, fileType);
+
+  // If custom API keys are provided, perform round-robin rotation & failover among them
   if (customApiKeys && customApiKeys.length > 0) {
     const activeKeys = customApiKeys.map(k => k.trim()).filter(k => k.length > 0);
     if (activeKeys.length > 0) {
       let attempt = 0;
       const maxAttempts = activeKeys.length;
       const debugLogs: any[] = [];
-      const model = process.env.GEMINI_MODEL || "gemini-3.5-flash";
-      const keywordsString = protectedKeywords.length > 0 ? protectedKeywords.join(", ") : "None";
 
       while (attempt < maxAttempts) {
-        const currentKey = activeKeys[attempt];
+        const keyIdx = (initialKeyIndex + attempt) % activeKeys.length;
+        const currentKey = activeKeys[keyIdx];
         const maskedKey = `${currentKey.slice(0, 4)}...${currentKey.slice(-4)}`;
         const startTime = Date.now();
 
@@ -187,59 +329,63 @@ async function generateSpintaxWithFailover(
             },
           });
 
-          const prompt = `You are an expert SEO Content Writer and AI Spintax Specialist.
-Your task is to convert the provided paragraph of text into high-quality, human-friendly Contextual Spintax.
-
-### Core Rules:
-1. FORMAT: Use the standard spintax format \`{variation1|variation2|...}\`. Do not nested-spin unless absolutely necessary.
-2. CONTEXTUAL REWRITE: Do NOT perform simple word-by-word synonym replacement. Rewrite complete sentences or logical phrases so the output reads naturally, flows elegantly, and is highly engaging for humans.
-3. SMART VARIATION: Automatically decide the number of variations:
-   - Simple sentences: 2 variations.
-   - Medium-complexity sentences: 3 variations.
-   - High-complexity sentences: 4 variations.
-   - Prioritize readability and quality. If generating too many variations makes it sound robotic or unnatural, reduce the number of variations.
-4. PRESERVE MEANING: Keep the original meaning, facts, names, numbers, and important information exactly. Do not add or remove facts, or change context.
-5. KEYWORD PROTECTION:
-   The following keywords are strictly protected: [${keywordsString}]
-   These protected keywords MUST remain exactly as-is. Do NOT translate them, do NOT replace them with synonyms, do NOT change their spelling, casing, or word order.
-6. HTML/MARKDOWN PROTECTION (Input Type: ${fileType}):
-   - If the input contains HTML tags (e.g. <h1>, <strong>, <a>, <img ...>, etc.) or Markdown syntax (e.g. #, **, *, [text](url), etc.), you MUST preserve all tags, attributes, and syntax symbols exactly.
-   - Only spin the text inside the HTML elements or Markdown structures. Do NOT spin or alter the tag tags themselves, tag attributes (like href, src, etc.), or Markdown syntax symbols.
-7. PARAGRAPH STRUCTURE: Return the entire paragraph with the spintax embedded, keeping the original paragraph structure intact. Do not add extra comments, markdown formatting around the output, or explanations. Only return the processed text.
-
-Input Paragraph:
-"""
-${paragraphText}
-"""`;
-
+          // Config with systemInstruction, explicit temperature, maxOutputTokens, and low thinking level
           const response = await ai.models.generateContent({
             model: model,
-            contents: prompt,
+            contents: `"""\n${paragraphText}\n"""`,
+            config: {
+              systemInstruction: systemInstruction,
+              temperature: 0.7,
+              maxOutputTokens: Math.min(8192, Math.max(1024, paragraphText.length * 4)),
+              // Low thinking level to optimize latency and cost for contextual spintax rewriting
+              thinkingConfig: {
+                thinkingLevel: ThinkingLevel.LOW,
+              },
+            },
           });
 
-          const spintaxText = response.text || "";
+          const candidate = response.candidates?.[0];
+          const finishReason = candidate?.finishReason;
+          const spintaxText = (response.text || "").trim();
           const duration = Date.now() - startTime;
+
+          // Check if blocked or finishReason is not STOP or output is empty/truncated
+          if (finishReason && finishReason !== "STOP") {
+            throw new Error(`Gemini API finishReason is "${finishReason}". Processing was incomplete or blocked.`);
+          }
+
+          if (spintaxText.length === 0) {
+            throw new Error("Gemini API returned an empty text response.");
+          }
+
+          if (paragraphText.length > 50 && spintaxText.length < Math.floor(paragraphText.length * 0.25)) {
+            throw new Error(`Output spintax text length (${spintaxText.length} chars) is severely truncated compared to original (${paragraphText.length} chars).`);
+          }
+
+          const validation = validateSpintaxOutput(paragraphText, spintaxText, protectedKeywords, fileType);
 
           debugLogs.push({
             time: new Date().toISOString(),
-            apiKeyName: `KUNCI_PRIBADI_${attempt + 1}`,
+            apiKeyName: `KUNCI_PRIBADI_${keyIdx + 1}`,
             maskedKey,
             model,
             durationMs: duration,
             status: "Success",
             attempt: attempt + 1,
+            validationIssues: validation.issues,
           });
 
           return {
-            spintaxText: spintaxText.trim(),
+            spintaxText,
             debugLogs,
+            validationIssues: validation.issues,
           };
         } catch (err: any) {
           const duration = Date.now() - startTime;
           const errMsg = err.message || "Unknown Gemini API Error";
           debugLogs.push({
             time: new Date().toISOString(),
-            apiKeyName: `KUNCI_PRIBADI_${attempt + 1}`,
+            apiKeyName: `KUNCI_PRIBADI_${keyIdx + 1}`,
             maskedKey,
             model,
             durationMs: duration,
@@ -247,7 +393,7 @@ ${paragraphText}
             error: errMsg,
             attempt: attempt + 1,
           });
-          console.warn(`Private API Key index ${attempt} failed (Attempt ${attempt + 1}). Error: ${errMsg}. Trying next private key.`);
+          console.warn(`Private API Key index ${keyIdx} failed (Attempt ${attempt + 1}). Error: ${errMsg}. Trying next private key.`);
           attempt++;
         }
       }
@@ -255,7 +401,8 @@ ${paragraphText}
     }
   }
 
-  const maxAttempts = Math.min(4, Math.max(3, apiKeys.length));
+  // Default server API keys flow
+  const maxAttempts = Math.max(1, apiKeys.length);
   let attempt = 0;
   const debugLogs: any[] = [];
 
@@ -268,8 +415,6 @@ ${paragraphText}
     }
 
     const startTime = Date.now();
-    const model = process.env.GEMINI_MODEL || "gemini-3.5-flash";
-    const keywordsString = protectedKeywords.length > 0 ? protectedKeywords.join(", ") : "None";
 
     try {
       const ai = new GoogleGenAI({
@@ -281,38 +426,39 @@ ${paragraphText}
         },
       });
 
-      const prompt = `You are an expert SEO Content Writer and AI Spintax Specialist.
-Your task is to convert the provided paragraph of text into high-quality, human-friendly Contextual Spintax.
-
-### Core Rules:
-1. FORMAT: Use the standard spintax format \`{variation1|variation2|...}\`. Do not nested-spin unless absolutely necessary.
-2. CONTEXTUAL REWRITE: Do NOT perform simple word-by-word synonym replacement. Rewrite complete sentences or logical phrases so the output reads naturally, flows elegantly, and is highly engaging for humans.
-3. SMART VARIATION: Automatically decide the number of variations:
-   - Simple sentences: 2 variations.
-   - Medium-complexity sentences: 3 variations.
-   - High-complexity sentences: 4 variations.
-   - Prioritize readability and quality. If generating too many variations makes it sound robotic or unnatural, reduce the number of variations.
-4. PRESERVE MEANING: Keep the original meaning, facts, names, numbers, and important information exactly. Do not add or remove facts, or change context.
-5. KEYWORD PROTECTION:
-   The following keywords are strictly protected: [${keywordsString}]
-   These protected keywords MUST remain exactly as-is. Do NOT translate them, do NOT replace them with synonyms, do NOT change their spelling, casing, or word order.
-6. HTML/MARKDOWN PROTECTION (Input Type: ${fileType}):
-   - If the input contains HTML tags (e.g. <h1>, <strong>, <a>, <img ...>, etc.) or Markdown syntax (e.g. #, **, *, [text](url), etc.), you MUST preserve all tags, attributes, and syntax symbols exactly.
-   - Only spin the text inside the HTML elements or Markdown structures. Do NOT spin or alter the tag tags themselves, tag attributes (like href, src, etc.), or Markdown syntax symbols.
-7. PARAGRAPH STRUCTURE: Return the entire paragraph with the spintax embedded, keeping the original paragraph structure intact. Do not add extra comments, markdown formatting around the output, or explanations. Only return the processed text.
-
-Input Paragraph:
-"""
-${paragraphText}
-"""`;
-
       const response = await ai.models.generateContent({
         model: model,
-        contents: prompt,
+        contents: `"""\n${paragraphText}\n"""`,
+        config: {
+          systemInstruction: systemInstruction,
+          temperature: 0.7,
+          maxOutputTokens: Math.min(8192, Math.max(1024, paragraphText.length * 4)),
+          // Low thinking level to optimize latency and cost for contextual spintax rewriting
+          thinkingConfig: {
+            thinkingLevel: ThinkingLevel.LOW,
+          },
+        },
       });
 
-      const spintaxText = response.text || "";
+      const candidate = response.candidates?.[0];
+      const finishReason = candidate?.finishReason;
+      const spintaxText = (response.text || "").trim();
       const duration = Date.now() - startTime;
+
+      // Check if blocked or finishReason is not STOP or output is empty/truncated
+      if (finishReason && finishReason !== "STOP") {
+        throw new Error(`Gemini API finishReason is "${finishReason}". Processing was incomplete or blocked.`);
+      }
+
+      if (spintaxText.length === 0) {
+        throw new Error("Gemini API returned an empty text response.");
+      }
+
+      if (paragraphText.length > 50 && spintaxText.length < Math.floor(paragraphText.length * 0.25)) {
+        throw new Error(`Output spintax text length (${spintaxText.length} chars) is severely truncated compared to original (${paragraphText.length} chars).`);
+      }
+
+      const validation = validateSpintaxOutput(paragraphText, spintaxText, protectedKeywords, fileType);
 
       debugLogs.push({
         time: new Date().toISOString(),
@@ -322,11 +468,13 @@ ${paragraphText}
         durationMs: duration,
         status: "Success",
         attempt: attempt + 1,
+        validationIssues: validation.issues,
       });
 
       return {
-        spintaxText: spintaxText.trim(),
+        spintaxText,
         debugLogs,
+        validationIssues: validation.issues,
       };
     } catch (err: any) {
       const duration = Date.now() - startTime;
@@ -429,67 +577,84 @@ app.post("/api/generate-spintax", async (req, res) => {
   const startTime = Date.now();
   
   const formattedKeywords = Array.isArray(keywords)
-    ? keywords.map((k: string) => k.trim()).filter((k: string) => k.length > 0)
+    ? keywords.map((k: string) => String(k).trim()).filter((k: string) => k.length > 0)
     : [];
 
-  const paragraphs = text
-    .split(/\n\s*\n/)
-    .map((p) => p.trim())
-    .filter((p) => p.length > 0);
+  const chunks = splitParagraphs(text, fileType);
 
-  if (paragraphs.length === 0) {
-    return res.status(400).json({ error: "Input text has no readable paragraphs" });
+  if (chunks.length === 0) {
+    return res.status(400).json({ error: "Input text has no readable paragraphs or chunks" });
   }
 
+  let partialFailures = 0;
   const allLogs: any[] = [];
-  const processedParagraphs: string[] = [];
+  const processedChunks: string[] = [];
+  const allValidationIssues: string[] = [];
 
-  try {
-    const results = await Promise.all(
-      paragraphs.map(async (paragraph, index) => {
-        if (paragraph.length < 5) {
-          return { spintaxText: paragraph, debugLogs: [] };
-        }
-        
-        try {
-          const result = await generateSpintaxWithFailover(paragraph, formattedKeywords, fileType, resolvedCustomKeys);
-          return result;
-        } catch (err: any) {
-          console.error(`Paragraph ${index} failed:`, err);
-          throw new Error(`Failed on paragraph ${index + 1}: ${err.message}`);
-        }
-      })
-    );
+  // Use Promise.allSettled so one chunk failure doesn't abort other successful chunks
+  const results = await Promise.allSettled(
+    chunks.map(async (chunk, index) => {
+      if (chunk.length < 5) {
+        return { spintaxText: chunk, debugLogs: [], validationIssues: [] };
+      }
+      return await generateSpintaxWithFailover(
+        chunk,
+        formattedKeywords,
+        fileType,
+        resolvedCustomKeys,
+        index
+      );
+    })
+  );
 
-    results.forEach((res) => {
-      processedParagraphs.push(res.spintaxText);
-      allLogs.push(...res.debugLogs);
-    });
+  results.forEach((res, index) => {
+    if (res.status === "fulfilled") {
+      processedChunks.push(res.value.spintaxText);
+      allLogs.push(...res.value.debugLogs);
+      if (res.value.validationIssues && res.value.validationIssues.length > 0) {
+        allValidationIssues.push(...res.value.validationIssues);
+      }
+    } else {
+      // Chunk failed after all retries: use original chunk text as fallback
+      partialFailures++;
+      const originalChunk = chunks[index];
+      processedChunks.push(originalChunk);
 
-    const finalSpintax = processedParagraphs.join("\n\n");
+      const errMsg = res.reason?.message || "Generation failed";
+      console.error(`Chunk ${index + 1} failed:`, errMsg);
 
-    const previews = [
-      resolveSpintax(finalSpintax, 1),
-      resolveSpintax(finalSpintax, 2),
-      resolveSpintax(finalSpintax, 3),
-    ];
+      allLogs.push({
+        time: new Date().toISOString(),
+        apiKeyName: "N/A",
+        maskedKey: "N/A",
+        model: process.env.GEMINI_MODEL || "gemini-flash-latest",
+        durationMs: 0,
+        status: "Failed-Fallback",
+        error: `Paragraf/Chunk ${index + 1} gagal di-spin: ${errMsg}. Teks asli digunakan sebagai fallback.`,
+        chunkIndex: index + 1,
+      });
+    }
+  });
 
-    const totalDuration = Date.now() - startTime;
+  const finalSpintax = processedChunks.join("\n\n");
 
-    res.json({
-      spintax: finalSpintax,
-      previews,
-      durationMs: totalDuration,
-      debugLogs: allLogs,
-      keysHealth: getKeysStatusMatrix(),
-    });
-  } catch (err: any) {
-    res.status(500).json({
-      error: err.message || "An unexpected error occurred during spintax generation.",
-      debugLogs: allLogs,
-      keysHealth: getKeysStatusMatrix(),
-    });
-  }
+  const previews = [
+    resolveSpintax(finalSpintax, 1),
+    resolveSpintax(finalSpintax, 2),
+    resolveSpintax(finalSpintax, 3),
+  ];
+
+  const totalDuration = Date.now() - startTime;
+
+  res.json({
+    spintax: finalSpintax,
+    previews,
+    durationMs: totalDuration,
+    debugLogs: allLogs,
+    keysHealth: getKeysStatusMatrix(),
+    partialFailures,
+    validationIssues: allValidationIssues,
+  });
 });
 
 export default app;

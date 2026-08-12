@@ -211,6 +211,9 @@ export default function App() {
       if (data.keysHealth) {
         setKeysHealth(data.keysHealth);
       }
+      if (data.partialFailures && data.partialFailures > 0) {
+        setErrorMessage(`Catatan: ${data.partialFailures} paragraf gagal di-spin oleh AI dan menggunakan teks asli sebagai fallback.`);
+      }
     } catch (err: any) {
       setErrorMessage(err.message || "Gagal menghubungi Google Gemini API. Silakan coba kembali.");
     } finally {

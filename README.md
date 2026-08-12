@@ -38,7 +38,7 @@ Di panel **Environment Variables** sebelum menekan deploy, masukkan kunci-kunci 
 
 3. **`GEMINI_MODEL`** (Opsional):
    * Key: `GEMINI_MODEL`
-   * Value: `gemini-3.5-flash` (atau model Gemini terbaru pilihan Anda)
+   * Value: `gemini-flash-latest` (atau model Gemini pilihan Anda)
 
 ### Langkah 5: Deploy!
 Setelah semua Environment Variables dimasukkan, klik tombol **Deploy**. Vercel akan memulai proses instalasi dependensi, melakukan build, dan memberikan URL aplikasi live Anda dalam waktu kurang dari 1-2 menit!
