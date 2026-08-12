@@ -27,4 +27,8 @@ export interface GenerateResponse {
   durationMs: number;
   debugLogs: DebugLog[];
   keysHealth: KeyHealth[];
+  partialFailures?: number;
+  validationIssues?: string[];
+  autoPatchedChunks?: number;
+  criticalIssueChunks?: number;
 }

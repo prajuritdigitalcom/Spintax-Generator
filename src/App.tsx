@@ -213,6 +213,10 @@ export default function App() {
       }
       if (data.partialFailures && data.partialFailures > 0) {
         setErrorMessage(`Catatan: ${data.partialFailures} paragraf gagal di-spin oleh AI dan menggunakan teks asli sebagai fallback.`);
+      } else if (data.criticalIssueChunks && data.criticalIssueChunks > 0) {
+        setErrorMessage(`Peringatan: ${data.criticalIssueChunks} paragraf masih gagal memenuhi cakupan spintax wajib meski sudah di-retry maksimal. Mohon periksa manual sebelum dipublikasikan.`);
+      } else if (data.autoPatchedChunks && data.autoPatchedChunks > 0) {
+        setErrorMessage(`Catatan: ${data.autoPatchedChunks} paragraf diselamatkan otomatis oleh fallback minimal karena AI gagal menghasilkan spintax setelah retry. Disarankan ditinjau ulang.`);
       }
     } catch (err: any) {
       setErrorMessage(err.message || "Gagal menghubungi Google Gemini API. Silakan coba kembali.");

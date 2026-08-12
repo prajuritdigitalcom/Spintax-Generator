@@ -310,7 +310,8 @@ Your task is to convert the provided paragraph of text into high-quality, human-
    FIX: either merge the two blocks into a single block with pre-paired, non-redundant options (e.g. "{rumah sakit atau klinik yang baru dibangun|klinik atau rumah sakit yang baru berdiri}"), or make the second block's options generic enough that they don't repeat any noun that could already appear in the first block (e.g. use "yang baru saja rampung dibangun" instead of naming the facility type again).
 11. RHETORICAL VARIETY: Do not rely on the same contrastive sentence pattern (e.g. "bukan X, melainkan Y" / "bukan sekadar X, tapi Y") more than ONCE within a single chunk you are processing. If the source paragraph naturally has multiple contrastive ideas, vary the construction across additive ("selain itu"), causal ("karena itu"), sequential ("setelah itu"), or plain declarative sentences instead of repeating the same contrast template.
 12. OPTION LENGTH BALANCE: Within a single spintax block, keep the word count of the longest option no more than roughly 1.8x the word count of the shortest option. If one natural phrasing is much shorter or longer than the others, rephrase it to a comparable length rather than leaving a large mismatch.
-13. SUBJECT VARIATION: If the source text repeatedly uses the first-person plural pronoun ("kami"/"we") as the sentence subject, vary it occasionally across spintax options within a block — e.g. alternate between "kami", the company name, "tim kami", or a passive construction — as long as meaning and protected keywords are preserved. Do not force this if it makes the sentence unnatural.`;
+13. SUBJECT VARIATION: If the source text repeatedly uses the first-person plural pronoun ("kami"/"we") as the sentence subject, vary it occasionally across spintax options within a block — e.g. alternate between "kami", the company name, "tim kami", or a passive construction — as long as meaning and protected keywords are preserved. Do not force this if it makes the sentence unnatural.
+14. SHORT PARAGRAPH ENFORCEMENT: Rule 7 (mandatory spintax coverage) applies with EQUAL strictness to short paragraphs, single-sentence paragraphs, calls-to-action, contact/closing blocks, and short list-style statements (e.g. a single company-value sentence). Being short is NEVER a valid reason to return plain unspun text. For a short paragraph, at minimum wrap the opening clause into a 2-3 option spintax block, and where natural, wrap a second clause as well (e.g. the closing phrase or a key adjective). Treat a 1-2 sentence CTA or contact paragraph exactly the same as a long paragraph for this rule.`;
 }
 
 // ------------------------------------------
@@ -567,7 +568,51 @@ async function processWithConcurrencyLimit<T, R>(
   return results;
 }
 
-// Execution with validation and 1x correction retry
+// Classify validation issues into critical (must fix) vs soft (best-effort)
+function classifyIssues(issues: string[]): { critical: string[]; soft: string[] } {
+  const critical: string[] = [];
+  const soft: string[] = [];
+  for (const issue of issues) {
+    const isCritical =
+      issue.includes("tidak mengandung blok spintax sama sekali") ||
+      issue.includes("tidak seimbang") ||
+      issue.includes("Kata kunci terproteksi") ||
+      issue.includes("Jumlah tag HTML berkurang");
+    (isCritical ? critical : soft).push(issue);
+  }
+  return { critical, soft };
+}
+
+function buildCorrectionPrompt(base: string, criticalIssues: string[], isFinalAttempt: boolean): string {
+  const urgencyNote = isFinalAttempt
+    ? "PERINGATAN: INI PERCOBAAN TERAKHIR. Anda WAJIB menghasilkan minimal 1 blok spintax {opsi1|opsi2} di paragraf ini walau hanya membungkus satu klausa pendek. JANGAN kembalikan teks polos tanpa kurung kurawal apapun alasannya, termasuk karena paragrafnya pendek atau berupa CTA/kontak."
+    : "Perbaiki pelanggaran berikut sebelum mengembalikan hasil.";
+  return `${base}\n\nCATATAN PERBAIKAN:\n${urgencyNote}\n- ${criticalIssues.join("\n- ")}\nTulis ulang dan pastikan SEMUA aturan dipatuhi, terutama poin di atas.`;
+}
+
+const FALLBACK_SYNONYM_PAIRS: [RegExp, string[]][] = [
+  [/\bKami\b/, ["Kami", "Tim kami"]],
+  [/\bkami\b/, ["kami", "tim kami"]],
+  [/\bJika Anda\b/, ["Jika Anda", "Bila Anda", "Apabila Anda"]],
+  [/\bAnda\b/, ["Anda", "Bapak/Ibu"]],
+  [/\bsedang\b/, ["sedang", "tengah"]],
+  [/\bkembali\b/, ["kembali", "lagi"]],
+  [/\bmenjadi\b/, ["menjadi", "sebagai"]],
+];
+
+function forceMinimalSpintaxFallback(text: string): { text: string; patched: boolean } {
+  for (const [pattern, options] of FALLBACK_SYNONYM_PAIRS) {
+    const match = text.match(pattern);
+    if (match && match.index !== undefined) {
+      const block = `{${options.join("|")}}`;
+      const patched = text.slice(0, match.index) + block + text.slice(match.index + match[0].length);
+      return { text: patched, patched: true };
+    }
+  }
+  return { text, patched: false };
+}
+
+// Execution with validation and retry with issue escalation
 async function executeWithValidationAndRetry(
   ai: GoogleGenAI,
   model: string,
@@ -576,7 +621,12 @@ async function executeWithValidationAndRetry(
   protectedKeywords: string[],
   fileType: string,
   styleNote = ""
-): Promise<{ spintaxText: string; validationIssues: string[] }> {
+): Promise<{
+  spintaxText: string;
+  validationIssues: string[];
+  autoPatched: boolean;
+  criticalUnresolved: boolean;
+}> {
   const tokenBudget = Math.min(16384, Math.max(2048, paragraphText.length * 6));
   const promptContents = styleNote
     ? `"""\n${paragraphText}\n"""${styleNote}`
@@ -614,19 +664,26 @@ async function executeWithValidationAndRetry(
 
   spintaxText = sanitizeSpintaxText(spintaxText);
   let validation = validateSpintaxOutput(paragraphText, spintaxText, protectedKeywords, fileType);
+  let { critical, soft } = classifyIssues(validation.issues);
 
-  // If validation failed, attempt 1x correction retry
-  if (!validation.ok) {
+  const MAX_ATTEMPTS = 3; // 1 initial + up to 2 correction retries for critical issues
+  let attempt = 1;
+  let currentText = spintaxText;
+
+  while (critical.length > 0 && attempt < MAX_ATTEMPTS) {
+    attempt++;
+    const isFinalAttempt = attempt === MAX_ATTEMPTS;
+    const correctionPrompt = buildCorrectionPrompt(promptContents, critical, isFinalAttempt);
+
     try {
-      console.warn("Spintax validation issues detected. Attempting 1x correction retry:", validation.issues);
-      const correctionPrompt = `${promptContents}\n\nCATATAN PERBAIKAN: Hasil sebelumnya melanggar aturan berikut:\n- ${validation.issues.join("\n- ")}\nTulis ulang dan pastikan SEMUA aturan dipatuhi, terutama poin yang dilanggar ini.`;
+      console.warn(`Spintax critical issues detected (Attempt ${attempt}/${MAX_ATTEMPTS}). Retrying:`, critical);
 
       const retryResponse = await ai.models.generateContent({
         model: model,
         contents: correctionPrompt,
         config: {
           systemInstruction: systemInstruction,
-          temperature: 0.7,
+          temperature: isFinalAttempt ? 0.4 : 0.7,
           maxOutputTokens: tokenBudget,
           thinkingConfig: {
             thinkingLevel: ThinkingLevel.MEDIUM,
@@ -638,19 +695,36 @@ async function executeWithValidationAndRetry(
       if (retryCandidate?.finishReason === "STOP" && retryResponse.text?.trim()) {
         const retrySpintax = sanitizeSpintaxText(retryResponse.text.trim());
         const retryVal = validateSpintaxOutput(paragraphText, retrySpintax, protectedKeywords, fileType);
-        if (retryVal.ok || retryVal.issues.length < validation.issues.length) {
-          spintaxText = retrySpintax;
+        const retryClassified = classifyIssues(retryVal.issues);
+
+        if (retryVal.ok || retryClassified.critical.length < critical.length || retryVal.issues.length < validation.issues.length) {
+          currentText = retrySpintax;
           validation = retryVal;
+          critical = retryClassified.critical;
+          soft = retryClassified.soft;
         }
       }
     } catch (retryErr) {
-      console.warn("Correction retry failed, proceeding with initial output:", retryErr);
+      console.warn(`Correction retry attempt ${attempt} failed:`, retryErr);
+    }
+  }
+
+  // Deterministic Fallback if 0 spintax issue persists
+  let autoPatched = false;
+  if (critical.some((i) => i.includes("tidak mengandung blok spintax sama sekali"))) {
+    const fallback = forceMinimalSpintaxFallback(currentText);
+    if (fallback.patched) {
+      currentText = fallback.text;
+      autoPatched = true;
+      critical = critical.filter((i) => !i.includes("tidak mengandung blok spintax sama sekali"));
     }
   }
 
   return {
-    spintaxText,
-    validationIssues: validation.issues,
+    spintaxText: currentText,
+    validationIssues: [...critical, ...soft],
+    autoPatched,
+    criticalUnresolved: critical.length > 0,
   };
 }
 
@@ -664,7 +738,13 @@ async function generateSpintaxWithFailover(
   customApiKeys?: string[],
   initialKeyIndex = 0,
   styleNote = ""
-): Promise<{ spintaxText: string; debugLogs: any[]; validationIssues: string[] }> {
+): Promise<{
+  spintaxText: string;
+  debugLogs: any[];
+  validationIssues: string[];
+  autoPatched: boolean;
+  criticalUnresolved: boolean;
+}> {
   const model = process.env.GEMINI_MODEL || "gemini-flash-latest";
   const systemInstruction = buildSystemInstruction(protectedKeywords, fileType);
 
@@ -705,7 +785,7 @@ async function generateSpintaxWithFailover(
             },
           });
 
-          const { spintaxText, validationIssues } = await executeWithValidationAndRetry(
+          const { spintaxText, validationIssues, autoPatched, criticalUnresolved } = await executeWithValidationAndRetry(
             ai,
             model,
             paragraphText,
@@ -732,6 +812,8 @@ async function generateSpintaxWithFailover(
             spintaxText,
             debugLogs,
             validationIssues,
+            autoPatched,
+            criticalUnresolved,
           };
         } catch (err: any) {
           const duration = Date.now() - startTime;
@@ -788,7 +870,7 @@ async function generateSpintaxWithFailover(
         },
       });
 
-      const { spintaxText, validationIssues } = await executeWithValidationAndRetry(
+      const { spintaxText, validationIssues, autoPatched, criticalUnresolved } = await executeWithValidationAndRetry(
         ai,
         model,
         paragraphText,
@@ -815,6 +897,8 @@ async function generateSpintaxWithFailover(
         spintaxText,
         debugLogs,
         validationIssues,
+        autoPatched,
+        criticalUnresolved,
       };
     } catch (err: any) {
       const duration = Date.now() - startTime;
@@ -926,6 +1010,8 @@ app.post("/api/generate-spintax", async (req, res) => {
   }
 
   let partialFailures = 0;
+  let autoPatchedChunks = 0;
+  let criticalIssueChunks = 0;
   const allLogs: any[] = [];
   const processedChunks: string[] = [];
   const allValidationIssues: string[] = [];
@@ -946,7 +1032,7 @@ app.post("/api/generate-spintax", async (req, res) => {
     concurrencyLimit,
     async (chunk, index) => {
       if (chunk.length < 5) {
-        return { spintaxText: chunk, debugLogs: [], validationIssues: [] };
+        return { spintaxText: chunk, debugLogs: [], validationIssues: [], autoPatched: false, criticalUnresolved: false };
       }
       const styleNote = buildStyleMemoryNote(sharedStyleMemory);
       const res = await generateSpintaxWithFailover(
@@ -971,6 +1057,12 @@ app.post("/api/generate-spintax", async (req, res) => {
       allLogs.push(...res.value.debugLogs);
       if (res.value.validationIssues && res.value.validationIssues.length > 0) {
         allValidationIssues.push(...res.value.validationIssues);
+      }
+      if (res.value.autoPatched) {
+        autoPatchedChunks++;
+      }
+      if (res.value.criticalUnresolved) {
+        criticalIssueChunks++;
       }
     } else {
       // Chunk failed after all retries: use original chunk text as fallback
@@ -1012,6 +1104,8 @@ app.post("/api/generate-spintax", async (req, res) => {
     keysHealth: getKeysStatusMatrix(),
     partialFailures,
     validationIssues: allValidationIssues,
+    autoPatchedChunks,
+    criticalIssueChunks,
   });
 });
 
