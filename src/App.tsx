@@ -320,7 +320,7 @@ export default function App() {
           <div className="flex items-center gap-2">
             <div className="inline-flex items-center gap-1 bg-slate-100 border border-slate-200/80 rounded-full px-3 py-1 text-xs font-semibold text-slate-600 font-mono">
               <Lock className="h-3.5 w-3.5 text-slate-400" />
-              Model: {process.env.GEMINI_MODEL || "gemini-3.5-flash"}
+              Model: {(import.meta as any).env?.VITE_GEMINI_MODEL || process.env.GEMINI_MODEL || "gemini-flash-latest"}
             </div>
           </div>
         </div>
