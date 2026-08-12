@@ -8,6 +8,9 @@ dotenv.config();
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
+// Helper sleep function
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 // ==========================================
 // Multi API Key Manager & Rotation State
 // ==========================================
@@ -22,6 +25,9 @@ interface ApiKeyInfo {
 }
 
 const apiKeys: ApiKeyInfo[] = [];
+
+// Shared in-memory map tracking custom keys -> timestamp when it becomes usable again
+const customKeysCooldownMap = new Map<string, number>();
 
 function initializeApiKeys() {
   apiKeys.length = 0; // Clear existing
@@ -65,6 +71,37 @@ function initializeApiKeys() {
 // Initial sync
 initializeApiKeys();
 
+// Parsing & Rate-limit helpers
+function parseRetryDelayMs(errMessage: string): number | null {
+  const match = errMessage.match(/"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/i);
+  if (match) {
+    return Math.ceil(parseFloat(match[1]) * 1000);
+  }
+  const secMatch = errMessage.match(/(\d+(?:\.\d+)?)\s*s(?:econds?)?/i);
+  if (errMessage.includes("RESOURCE_EXHAUSTED") || errMessage.includes("429")) {
+    if (secMatch) return Math.ceil(parseFloat(secMatch[1]) * 1000);
+    return 10000; // default 10s wait if quota error
+  }
+  return null;
+}
+
+function isQuotaError(errMessage: string): boolean {
+  return (
+    errMessage.includes("RESOURCE_EXHAUSTED") ||
+    errMessage.includes("429") ||
+    errMessage.includes("Quota exceeded") ||
+    errMessage.includes("rate limit")
+  );
+}
+
+function isPermanentKeyError(errMessage: string): boolean {
+  return (
+    errMessage.includes("API key not valid") ||
+    errMessage.includes("API_KEY_INVALID") ||
+    errMessage.includes("PERMISSION_DENIED")
+  );
+}
+
 // Retrieve key matrix for health checks
 function getKeysStatusMatrix() {
   const now = Date.now();
@@ -94,7 +131,7 @@ function getKeysStatusMatrix() {
 function getBestApiKey(): ApiKeyInfo {
   const now = Date.now();
 
-  // Reset keys that completed their cooldown
+  // Reset keys that completed their cooldown (unless Disabled)
   for (const info of apiKeys) {
     if (info.status === "Cooling Down" && now >= info.cooldownEnd) {
       info.status = "Ready";
@@ -109,7 +146,7 @@ function getBestApiKey(): ApiKeyInfo {
     if (apiKeys.length === 0) {
       throw new Error("No Gemini API Keys are configured. Please define GEMINI_API_KEY in Settings > Secrets.");
     }
-    throw new Error("All configured Gemini API keys are currently Cooling Down due to rate-limiting or quota errors.");
+    throw new Error("All configured Gemini API keys are currently Cooling Down or Disabled due to rate-limiting or invalid key errors.");
   }
 
   // Sort by lastUsed (ascending) for balanced load-distribution (Least Recently Used)
@@ -119,12 +156,50 @@ function getBestApiKey(): ApiKeyInfo {
   return chosen;
 }
 
-// Mark key as cooling down on failure
+// Mark server key as cooling down or disabled
 function markKeyCooldown(info: ApiKeyInfo, errMessage: string) {
-  info.status = "Cooling Down";
-  info.cooldownEnd = Date.now() + 10 * 60 * 1000; // 10 minutes cooldown
   info.failureCount += 1;
   info.errorMessage = errMessage;
+
+  if (isPermanentKeyError(errMessage)) {
+    info.status = "Disabled";
+    info.cooldownEnd = Infinity;
+    return;
+  }
+
+  const retryDelay = parseRetryDelayMs(errMessage);
+  if (retryDelay !== null) {
+    info.status = "Cooling Down";
+    info.cooldownEnd = Date.now() + retryDelay + 5000;
+  } else if (isQuotaError(errMessage)) {
+    info.status = "Cooling Down";
+    info.cooldownEnd = Date.now() + 15000;
+  } else {
+    info.status = "Cooling Down";
+    info.cooldownEnd = Date.now() + 2 * 60 * 1000;
+  }
+}
+
+// Shared cooldown for custom API keys
+function getCustomKeyCooldown(key: string): number {
+  const until = customKeysCooldownMap.get(key) || 0;
+  const now = Date.now();
+  return until > now ? until - now : 0;
+}
+
+function markCustomKeyCooldown(key: string, errMessage: string) {
+  if (isPermanentKeyError(errMessage)) {
+    customKeysCooldownMap.set(key, Date.now() + 24 * 60 * 60 * 1000); // 24h
+    return;
+  }
+  const retryDelay = parseRetryDelayMs(errMessage);
+  if (retryDelay !== null) {
+    customKeysCooldownMap.set(key, Date.now() + retryDelay + 5000);
+  } else if (isQuotaError(errMessage)) {
+    customKeysCooldownMap.set(key, Date.now() + 15000);
+  } else {
+    customKeysCooldownMap.set(key, Date.now() + 60000);
+  }
 }
 
 // ==========================================
@@ -141,11 +216,18 @@ function resolveSpintax(text: string, previewNum: number): string {
     if (!match) break;
 
     const fullMatch = match[0];
-    const options = match[1].split("|");
+    const rawOptions = match[1].split("|").map(o => o.trim()).filter(o => o.length > 0);
+    // Remove duplicate options
+    const options = Array.from(new Set(rawOptions));
+    if (options.length === 0) options.push("");
 
-    // Pick option deterministically based on previewNum (1, 2, 3) and block occurrence counter
-    // Ensures Preview 1, 2, and 3 are distinct whenever options >= 3
-    const chosenIndex = (previewNum - 1 + blockCounter) % options.length;
+    // Calculate index with offset so preview 1, 2, and 3 vary even for 2-option blocks
+    let offset = previewNum - 1;
+    if (previewNum === 3 && options.length === 2) {
+      offset = blockCounter % 2 === 0 ? 1 : 0;
+    }
+
+    const chosenIndex = (blockCounter + offset) % options.length;
     const replacement = options[chosenIndex] || options[0] || "";
     resolved = resolved.replace(fullMatch, replacement);
     blockCounter++;
@@ -155,35 +237,42 @@ function resolveSpintax(text: string, previewNum: number): string {
   return resolved;
 }
 
+// Deterministic post-processing for AI punctuation artifacts
+function sanitizeSpintaxText(text: string): string {
+  // Replace em dash (—) and en dash (–) with comma
+  let cleaned = text.replace(/\s*[—–]\s*/g, ", ");
+  // Fix double commas if created
+  cleaned = cleaned.replace(/,\s*,/g, ",");
+  return cleaned;
+}
+
 // ==========================================
 // System Instruction & Validation Helpers
 // ==========================================
 
-// Single prompt source for spintax rules
 function buildSystemInstruction(protectedKeywords: string[], fileType: string): string {
   const keywordsString = protectedKeywords.length > 0 ? protectedKeywords.join(", ") : "None";
   return `You are an expert SEO Content Writer and AI Spintax Specialist.
 Your task is to convert the provided paragraph of text into high-quality, human-friendly Contextual Spintax.
 
 ### Core Rules:
-1. FORMAT: Use the standard spintax format \`{variation1|variation2|...}\`. Never produce nested spintax (a \`{...}\` block inside another \`{...}\` block). Each spintax block must contain plain text options only.
+1. FORMAT: Use standard spintax format \`{variation1|variation2|...}\`. Never produce nested spintax (a \`{...}\` block inside another \`{...}\` block). Each spintax block must contain plain text options only.
 2. CONTEXTUAL REWRITE: Do NOT perform simple word-by-word synonym replacement. Rewrite complete sentences or logical phrases so the output reads naturally, flows elegantly, and is highly engaging for humans.
-3. SMART VARIATION: Automatically decide the number of variations:
-   - Simple sentences: 2 variations.
-   - Medium-complexity sentences: 3 variations.
-   - High-complexity sentences: 4 variations.
-   - Prioritize readability and quality. If generating too many variations makes it sound robotic or unnatural, reduce the number of variations.
+3. SMART VARIATION: Automatically decide the number of variations (minimum 2 variations per block, 3 for medium complexity, 4 for high complexity). Never generate 0 or 1 variation.
 4. PRESERVE MEANING: Keep the original meaning, facts, names, numbers, and important information exactly. Do not add or remove facts, or change context.
 5. KEYWORD PROTECTION:
    The following keywords are strictly protected: [${keywordsString}]
    These protected keywords MUST remain exactly as-is. Do NOT translate them, do NOT replace them with synonyms, do NOT change their spelling, casing, or word order.
-6. HTML/MARKDOWN PROTECTION (Input Type: ${fileType}):
+   ADDITIONAL RULE: Protected keywords must NEVER be placed as one of multiple options inside a {option1|option2} spin block alongside a synonym or alternative phrasing. They must appear as fixed, unspun plain text at their original position, identical across every possible resolution of the spintax.
+6. NO AI-STYLE PUNCTUATION: Never use the em dash (—) or en dash (–) to connect clauses. Rewrite using a comma, period, colon, or a natural connecting word instead. This applies to every variation inside every spintax block.
+7. MANDATORY SPINTAX COVERAGE: Every paragraph/chunk you receive MUST be converted into spintax. Do not return any paragraph as plain, unspun text. Minimum 2 variations per spintax block, even for short or simple sentences, even when the paragraph contains technical terminology or product lists — vary the surrounding sentence structure while keeping technical terms fixed inside each option.
+8. HTML/MARKDOWN PROTECTION (Input Type: ${fileType}):
    - If the input contains HTML tags (e.g. <h1>, <strong>, <a>, <img ...>, etc.) or Markdown syntax (e.g. #, **, *, [text](url), etc.), you MUST preserve all tags, attributes, and syntax symbols exactly.
    - Only spin the text inside the HTML elements or Markdown structures. Do NOT spin or alter the tag tags themselves, tag attributes (like href, src, etc.), or Markdown syntax symbols.
-7. PARAGRAPH STRUCTURE: Return the entire paragraph with the spintax embedded, keeping the original paragraph structure intact. Do not add extra comments, markdown formatting around the output, or explanations. Only return the processed text.`;
+9. PARAGRAPH STRUCTURE: Return the entire paragraph with the spintax embedded, keeping the original paragraph structure intact. Do not add extra comments, markdown formatting around the output, or explanations. Only return the processed text.`;
 }
 
-// Lightweight post-generation validation
+// Post-generation validation
 function validateSpintaxOutput(
   original: string,
   output: string,
@@ -192,16 +281,31 @@ function validateSpintaxOutput(
 ): { ok: boolean; issues: string[] } {
   const issues: string[] = [];
 
-  // Check protected keywords presence
+  // 1. Check balanced braces
+  const openBraces = (output.match(/\{/g) || []).length;
+  const closeBraces = (output.match(/\}/g) || []).length;
+  if (openBraces !== closeBraces) {
+    issues.push(`Sintaks spintax tidak seimbang (jumlah '{' (${openBraces}) dan '}' (${closeBraces}) tidak sama).`);
+  }
+
+  // 2. Mandatory spintax coverage check
+  if (original.length > 30 && !output.includes("{")) {
+    issues.push("Paragraf tidak mengandung blok spintax sama sekali (0 variasi).");
+  }
+
+  // 3. Check protected keywords presence & fixed position outside spintax blocks
+  const unspunText = output.replace(/\{[^{}]+\}/g, "");
   for (const kw of protectedKeywords) {
     if (kw.trim().length > 0) {
       if (!output.includes(kw)) {
         issues.push(`Kata kunci terproteksi "${kw}" tidak ditemukan pada hasil spintax.`);
+      } else if (!unspunText.includes(kw)) {
+        issues.push(`Kata kunci terproteksi "${kw}" diletakkan di dalam opsi spintax {option1|option2}, bukan sebagai teks tetap.`);
       }
     }
   }
 
-  // Check HTML tags preservation
+  // 4. Check HTML tags preservation
   if (fileType === "html") {
     const htmlTagRegex = /<[a-zA-Z][^>]*>/g;
     const origTags = (original.match(htmlTagRegex) || []).length;
@@ -259,17 +363,17 @@ function splitParagraphs(text: string, fileType: string): string[] {
     }
   }
 
-  // 2. Enforce hard max length limit per chunk (~6000 chars)
+  // 2. Enforce hard max length limit per chunk (~4000 chars)
   const finalChunks: string[] = [];
-  const MAX_CHUNK_LEN = 6000;
+  const MAX_CHUNK_LEN = 4000;
 
   for (const chunk of refinedChunks) {
     if (chunk.length <= MAX_CHUNK_LEN) {
       finalChunks.push(chunk);
     } else {
-      // Split long chunk by sentence endings or linebreaks
+      // Split long chunk by sentence endings, punctuation or linebreaks
       const sentences = chunk
-        .split(/(?<=\. |\n|<\/p>|<\/div>)/)
+        .split(/(?<=[.!?]\s+|\n|<\/p>|<\/div>)/g)
         .map((s) => s.trim())
         .filter((s) => s.length > 0);
 
@@ -291,6 +395,115 @@ function splitParagraphs(text: string, fileType: string): string[] {
   return finalChunks;
 }
 
+// Concurrency worker queue
+async function processWithConcurrencyLimit<T, R>(
+  items: T[],
+  limit: number,
+  processFn: (item: T, index: number) => Promise<R>
+): Promise<Array<{ status: "fulfilled"; value: R } | { status: "rejected"; reason: any }>> {
+  const results: Array<{ status: "fulfilled"; value: R } | { status: "rejected"; reason: any }> = new Array(items.length);
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < items.length) {
+      const index = cursor++;
+      try {
+        const val = await processFn(items[index], index);
+        results[index] = { status: "fulfilled", value: val };
+      } catch (err) {
+        results[index] = { status: "rejected", reason: err };
+      }
+    }
+  }
+
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  const workers = Array.from({ length: workerCount }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
+
+// Execution with validation and 1x correction retry
+async function executeWithValidationAndRetry(
+  ai: GoogleGenAI,
+  model: string,
+  paragraphText: string,
+  systemInstruction: string,
+  protectedKeywords: string[],
+  fileType: string
+): Promise<{ spintaxText: string; validationIssues: string[] }> {
+  const tokenBudget = Math.min(16384, Math.max(2048, paragraphText.length * 6));
+
+  const response = await ai.models.generateContent({
+    model: model,
+    contents: `"""\n${paragraphText}\n"""`,
+    config: {
+      systemInstruction: systemInstruction,
+      temperature: 0.7,
+      maxOutputTokens: tokenBudget,
+      thinkingConfig: {
+        thinkingLevel: ThinkingLevel.LOW,
+      },
+    },
+  });
+
+  const candidate = response.candidates?.[0];
+  const finishReason = candidate?.finishReason;
+  let spintaxText = (response.text || "").trim();
+
+  if (finishReason && finishReason !== "STOP") {
+    throw new Error(`Gemini API finishReason is "${finishReason}". Processing was incomplete or blocked.`);
+  }
+
+  if (spintaxText.length === 0) {
+    throw new Error("Gemini API returned an empty text response.");
+  }
+
+  if (paragraphText.length > 50 && spintaxText.length < Math.floor(paragraphText.length * 0.25)) {
+    throw new Error(`Output spintax text length (${spintaxText.length} chars) is severely truncated compared to original (${paragraphText.length} chars).`);
+  }
+
+  spintaxText = sanitizeSpintaxText(spintaxText);
+  let validation = validateSpintaxOutput(paragraphText, spintaxText, protectedKeywords, fileType);
+
+  // If validation failed, attempt 1x correction retry with escalated ThinkingLevel.MEDIUM
+  if (!validation.ok) {
+    try {
+      console.warn("Spintax validation issues detected. Attempting 1x correction retry:", validation.issues);
+      const correctionPrompt = `"""\n${paragraphText}\n"""\n\nCATATAN PERBAIKAN: Hasil sebelumnya melanggar aturan berikut:\n- ${validation.issues.join("\n- ")}\nTulis ulang dan pastikan SEMUA aturan dipatuhi, terutama poin yang dilanggar ini.`;
+
+      const retryResponse = await ai.models.generateContent({
+        model: model,
+        contents: correctionPrompt,
+        config: {
+          systemInstruction: systemInstruction,
+          temperature: 0.7,
+          maxOutputTokens: tokenBudget,
+          thinkingConfig: {
+            thinkingLevel: ThinkingLevel.MEDIUM,
+          },
+        },
+      });
+
+      const retryCandidate = retryResponse.candidates?.[0];
+      if (retryCandidate?.finishReason === "STOP" && retryResponse.text?.trim()) {
+        const retrySpintax = sanitizeSpintaxText(retryResponse.text.trim());
+        const retryVal = validateSpintaxOutput(paragraphText, retrySpintax, protectedKeywords, fileType);
+        if (retryVal.ok || retryVal.issues.length < validation.issues.length) {
+          spintaxText = retrySpintax;
+          validation = retryVal;
+        }
+      }
+    } catch (retryErr) {
+      console.warn("Correction retry failed, proceeding with initial output:", retryErr);
+    }
+  }
+
+  return {
+    spintaxText,
+    validationIssues: validation.issues,
+  };
+}
+
 // ==========================================
 // Gemini API Generator with Failover
 // ==========================================
@@ -301,7 +514,6 @@ async function generateSpintaxWithFailover(
   customApiKeys?: string[],
   initialKeyIndex = 0
 ): Promise<{ spintaxText: string; debugLogs: any[]; validationIssues: string[] }> {
-  // Use "gemini-flash-latest" as the resilient model default
   const model = process.env.GEMINI_MODEL || "gemini-flash-latest";
   const systemInstruction = buildSystemInstruction(protectedKeywords, fileType);
 
@@ -317,6 +529,19 @@ async function generateSpintaxWithFailover(
         const keyIdx = (initialKeyIndex + attempt) % activeKeys.length;
         const currentKey = activeKeys[keyIdx];
         const maskedKey = `${currentKey.slice(0, 4)}...${currentKey.slice(-4)}`;
+
+        // Check shared cooldown state for custom keys
+        const cdRemaining = getCustomKeyCooldown(currentKey);
+        if (cdRemaining > 0) {
+          if (cdRemaining <= 15000) {
+            await sleep(cdRemaining);
+          } else {
+            console.warn(`Custom API Key index ${keyIdx} is in cooldown for ${Math.ceil(cdRemaining/1000)}s. Trying next key.`);
+            attempt++;
+            continue;
+          }
+        }
+
         const startTime = Date.now();
 
         try {
@@ -329,40 +554,16 @@ async function generateSpintaxWithFailover(
             },
           });
 
-          // Config with systemInstruction, explicit temperature, maxOutputTokens, and low thinking level
-          const response = await ai.models.generateContent({
-            model: model,
-            contents: `"""\n${paragraphText}\n"""`,
-            config: {
-              systemInstruction: systemInstruction,
-              temperature: 0.7,
-              maxOutputTokens: Math.min(8192, Math.max(1024, paragraphText.length * 4)),
-              // Low thinking level to optimize latency and cost for contextual spintax rewriting
-              thinkingConfig: {
-                thinkingLevel: ThinkingLevel.LOW,
-              },
-            },
-          });
+          const { spintaxText, validationIssues } = await executeWithValidationAndRetry(
+            ai,
+            model,
+            paragraphText,
+            systemInstruction,
+            protectedKeywords,
+            fileType
+          );
 
-          const candidate = response.candidates?.[0];
-          const finishReason = candidate?.finishReason;
-          const spintaxText = (response.text || "").trim();
           const duration = Date.now() - startTime;
-
-          // Check if blocked or finishReason is not STOP or output is empty/truncated
-          if (finishReason && finishReason !== "STOP") {
-            throw new Error(`Gemini API finishReason is "${finishReason}". Processing was incomplete or blocked.`);
-          }
-
-          if (spintaxText.length === 0) {
-            throw new Error("Gemini API returned an empty text response.");
-          }
-
-          if (paragraphText.length > 50 && spintaxText.length < Math.floor(paragraphText.length * 0.25)) {
-            throw new Error(`Output spintax text length (${spintaxText.length} chars) is severely truncated compared to original (${paragraphText.length} chars).`);
-          }
-
-          const validation = validateSpintaxOutput(paragraphText, spintaxText, protectedKeywords, fileType);
 
           debugLogs.push({
             time: new Date().toISOString(),
@@ -372,17 +573,20 @@ async function generateSpintaxWithFailover(
             durationMs: duration,
             status: "Success",
             attempt: attempt + 1,
-            validationIssues: validation.issues,
+            validationIssues,
           });
 
           return {
             spintaxText,
             debugLogs,
-            validationIssues: validation.issues,
+            validationIssues,
           };
         } catch (err: any) {
           const duration = Date.now() - startTime;
           const errMsg = err.message || "Unknown Gemini API Error";
+
+          markCustomKeyCooldown(currentKey, errMsg);
+
           debugLogs.push({
             time: new Date().toISOString(),
             apiKeyName: `KUNCI_PRIBADI_${keyIdx + 1}`,
@@ -393,6 +597,12 @@ async function generateSpintaxWithFailover(
             error: errMsg,
             attempt: attempt + 1,
           });
+
+          const retryDelay = parseRetryDelayMs(errMsg);
+          if (retryDelay && retryDelay <= 30000) {
+            await sleep(Math.min(retryDelay, 30000));
+          }
+
           console.warn(`Private API Key index ${keyIdx} failed (Attempt ${attempt + 1}). Error: ${errMsg}. Trying next private key.`);
           attempt++;
         }
@@ -426,39 +636,16 @@ async function generateSpintaxWithFailover(
         },
       });
 
-      const response = await ai.models.generateContent({
-        model: model,
-        contents: `"""\n${paragraphText}\n"""`,
-        config: {
-          systemInstruction: systemInstruction,
-          temperature: 0.7,
-          maxOutputTokens: Math.min(8192, Math.max(1024, paragraphText.length * 4)),
-          // Low thinking level to optimize latency and cost for contextual spintax rewriting
-          thinkingConfig: {
-            thinkingLevel: ThinkingLevel.LOW,
-          },
-        },
-      });
+      const { spintaxText, validationIssues } = await executeWithValidationAndRetry(
+        ai,
+        model,
+        paragraphText,
+        systemInstruction,
+        protectedKeywords,
+        fileType
+      );
 
-      const candidate = response.candidates?.[0];
-      const finishReason = candidate?.finishReason;
-      const spintaxText = (response.text || "").trim();
       const duration = Date.now() - startTime;
-
-      // Check if blocked or finishReason is not STOP or output is empty/truncated
-      if (finishReason && finishReason !== "STOP") {
-        throw new Error(`Gemini API finishReason is "${finishReason}". Processing was incomplete or blocked.`);
-      }
-
-      if (spintaxText.length === 0) {
-        throw new Error("Gemini API returned an empty text response.");
-      }
-
-      if (paragraphText.length > 50 && spintaxText.length < Math.floor(paragraphText.length * 0.25)) {
-        throw new Error(`Output spintax text length (${spintaxText.length} chars) is severely truncated compared to original (${paragraphText.length} chars).`);
-      }
-
-      const validation = validateSpintaxOutput(paragraphText, spintaxText, protectedKeywords, fileType);
 
       debugLogs.push({
         time: new Date().toISOString(),
@@ -468,13 +655,13 @@ async function generateSpintaxWithFailover(
         durationMs: duration,
         status: "Success",
         attempt: attempt + 1,
-        validationIssues: validation.issues,
+        validationIssues,
       });
 
       return {
         spintaxText,
         debugLogs,
-        validationIssues: validation.issues,
+        validationIssues,
       };
     } catch (err: any) {
       const duration = Date.now() - startTime;
@@ -508,7 +695,6 @@ async function generateSpintaxWithFailover(
 // Get Health Check Status of API Keys
 app.get("/api/keys-health", (req, res) => {
   try {
-    const currentKeysCount = apiKeys.length;
     let hasChanged = false;
     
     if (process.env.GEMINI_API_KEY && !apiKeys.some(k => k.name === "GEMINI_API_KEY")) {
@@ -591,9 +777,14 @@ app.post("/api/generate-spintax", async (req, res) => {
   const processedChunks: string[] = [];
   const allValidationIssues: string[] = [];
 
-  // Use Promise.allSettled so one chunk failure doesn't abort other successful chunks
-  const results = await Promise.allSettled(
-    chunks.map(async (chunk, index) => {
+  const activeKeyCount = resolvedCustomKeys.length > 0 ? resolvedCustomKeys.length : Math.max(1, apiKeys.length);
+  // Cap worker concurrency to Math.min(activeKeyCount, 3) to prevent bursting free-tier API quotas
+  const concurrencyLimit = Math.max(1, Math.min(activeKeyCount, 3));
+
+  const results = await processWithConcurrencyLimit(
+    chunks,
+    concurrencyLimit,
+    async (chunk, index) => {
       if (chunk.length < 5) {
         return { spintaxText: chunk, debugLogs: [], validationIssues: [] };
       }
@@ -604,7 +795,7 @@ app.post("/api/generate-spintax", async (req, res) => {
         resolvedCustomKeys,
         index
       );
-    })
+    }
   );
 
   results.forEach((res, index) => {
