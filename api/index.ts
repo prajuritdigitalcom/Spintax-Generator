@@ -12,7 +12,7 @@ app.use(express.json({ limit: "10mb" }));
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ==========================================
-// Multi API Key Manager & Rotation State
+// Robin Key Manager & Rotation Engine
 // ==========================================
 interface ApiKeyInfo {
   name: string;
@@ -24,54 +24,19 @@ interface ApiKeyInfo {
   errorMessage?: string;
 }
 
-const apiKeys: ApiKeyInfo[] = [];
-
-// Shared in-memory map tracking custom keys -> timestamp when it becomes usable again
-const customKeysCooldownMap = new Map<string, number>();
-
-function initializeApiKeys() {
-  apiKeys.length = 0; // Clear existing
-
-  console.log("[VERCEL DIAGNOSTIC] Process Env Keys present:", Object.keys(process.env).filter(k => k.includes("KEY") || k.includes("GEMINI")));
-  
-  // Read standard GEMINI_API_KEY
-  if (process.env.GEMINI_API_KEY) {
-    console.log("[VERCEL DIAGNOSTIC] Found main GEMINI_API_KEY. Length:", process.env.GEMINI_API_KEY.length);
-    apiKeys.push({
-      name: "GEMINI_API_KEY",
-      key: process.env.GEMINI_API_KEY,
-      status: "Ready",
-      cooldownEnd: 0,
-      failureCount: 0,
-      lastUsed: 0,
-    });
-  } else {
-    console.log("[VERCEL DIAGNOSTIC] GEMINI_API_KEY is not defined in process.env");
-  }
-
-  // Scan all environment variables with GEMINI_API_KEY_ prefix
-  for (const envName in process.env) {
-    if (envName.startsWith("GEMINI_API_KEY_") && process.env[envName]) {
-      const val = process.env[envName] || "";
-      console.log(`[VERCEL DIAGNOSTIC] Found rotation key ${envName}. Length:`, val.length);
-      apiKeys.push({
-        name: envName,
-        key: val,
-        status: "Ready",
-        cooldownEnd: 0,
-        failureCount: 0,
-        lastUsed: 0,
-      });
-    }
-  }
-
-  console.log(`[VERCEL DIAGNOSTIC] Initialized API Key Manager with ${apiKeys.length} total keys.`);
+interface CustomKeyState {
+  key: string;
+  maskedKey: string;
+  status: "Ready" | "Cooling Down" | "Disabled";
+  cooldownEnd: number;
+  failureCount: number;
+  lastUsed: number;
+  errorMessage?: string;
 }
 
-// Initial sync
-initializeApiKeys();
+// Global Custom Keys state cache
+const customKeyStatesMap = new Map<string, CustomKeyState>();
 
-// Parsing & Rate-limit helpers
 function parseRetryDelayMs(errMessage: string): number | null {
   const match = errMessage.match(/"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/i);
   if (match) {
@@ -80,7 +45,7 @@ function parseRetryDelayMs(errMessage: string): number | null {
   const secMatch = errMessage.match(/(\d+(?:\.\d+)?)\s*s(?:econds?)?/i);
   if (errMessage.includes("RESOURCE_EXHAUSTED") || errMessage.includes("429")) {
     if (secMatch) return Math.ceil(parseFloat(secMatch[1]) * 1000);
-    return 10000; // default 10s wait if quota error
+    return 10000;
   }
   return null;
 }
@@ -98,109 +63,208 @@ function isPermanentKeyError(errMessage: string): boolean {
   return (
     errMessage.includes("API key not valid") ||
     errMessage.includes("API_KEY_INVALID") ||
-    errMessage.includes("PERMISSION_DENIED")
+    errMessage.includes("PERMISSION_DENIED") ||
+    errMessage.includes("RESOURCE_PROJECT_INVALID")
   );
 }
 
-// Retrieve key matrix for health checks
-function getKeysStatusMatrix() {
+function getCustomKeyState(keyString: string): CustomKeyState {
+  const key = keyString.trim();
+  const maskedKey = key ? `${key.slice(0, 4)}...${key.slice(-4)}` : "None";
+  let state = customKeyStatesMap.get(key);
+  if (!state) {
+    state = {
+      key,
+      maskedKey,
+      status: "Ready",
+      cooldownEnd: 0,
+      failureCount: 0,
+      lastUsed: 0,
+    };
+    customKeyStatesMap.set(key, state);
+  }
   const now = Date.now();
-  return apiKeys.map((info) => {
-    let currentStatus = info.status;
-    let timeRemaining = 0;
-    if (info.status === "Cooling Down") {
-      if (now >= info.cooldownEnd) {
-        currentStatus = "Ready";
-      } else {
-        timeRemaining = Math.ceil((info.cooldownEnd - now) / 1000);
+  if (state.status === "Cooling Down" && now >= state.cooldownEnd) {
+    state.status = "Ready";
+    state.cooldownEnd = 0;
+    state.errorMessage = undefined;
+  }
+  return state;
+}
+
+function recordCustomKeyError(state: CustomKeyState, errMessage: string): void {
+  state.failureCount += 1;
+  state.errorMessage = errMessage;
+  const now = Date.now();
+
+  if (isPermanentKeyError(errMessage)) {
+    state.status = "Disabled";
+    state.cooldownEnd = Infinity;
+    console.warn(`[ROBIN-CUSTOM] Key ${state.maskedKey} permanently disabled.`);
+    return;
+  }
+
+  const retryDelay = parseRetryDelayMs(errMessage);
+  if (retryDelay !== null) {
+    state.status = "Cooling Down";
+    state.cooldownEnd = now + retryDelay + 2000;
+  } else if (isQuotaError(errMessage)) {
+    state.status = "Cooling Down";
+    const backoff = Math.min(60000, Math.max(10000, state.failureCount * 10000));
+    state.cooldownEnd = now + backoff;
+  } else {
+    state.status = "Cooling Down";
+    state.cooldownEnd = now + 10000;
+  }
+  console.warn(`[ROBIN-CUSTOM] Key ${state.maskedKey} cooling down until +${Math.ceil((state.cooldownEnd - now) / 1000)}s.`);
+}
+
+function recordCustomKeySuccess(state: CustomKeyState): void {
+  state.status = "Ready";
+  state.errorMessage = undefined;
+}
+
+export class RobinKeyManager {
+  private keys: ApiKeyInfo[] = [];
+  private rrCursor: number = 0;
+
+  constructor() {}
+
+  public initializeFromEnv(): void {
+    const existingMap = new Map<string, ApiKeyInfo>();
+    for (const k of this.keys) {
+      existingMap.set(k.name, k);
+    }
+
+    const newKeys: ApiKeyInfo[] = [];
+
+    if (process.env.GEMINI_API_KEY) {
+      const existing = existingMap.get("GEMINI_API_KEY");
+      newKeys.push(
+        existing || {
+          name: "GEMINI_API_KEY",
+          key: process.env.GEMINI_API_KEY,
+          status: "Ready",
+          cooldownEnd: 0,
+          failureCount: 0,
+          lastUsed: 0,
+        }
+      );
+    }
+
+    for (const envName in process.env) {
+      if (envName.startsWith("GEMINI_API_KEY_") && process.env[envName]) {
+        const val = process.env[envName] || "";
+        const existing = existingMap.get(envName);
+        newKeys.push(
+          existing || {
+            name: envName,
+            key: val,
+            status: "Ready",
+            cooldownEnd: 0,
+            failureCount: 0,
+            lastUsed: 0,
+          }
+        );
       }
     }
-    return {
-      name: info.name,
-      maskedKey: info.key ? `${info.key.slice(0, 4)}...${info.key.slice(-4)}` : "None",
-      status: currentStatus,
-      timeRemaining, // in seconds
-      failureCount: info.failureCount,
-      lastUsed: info.lastUsed ? new Date(info.lastUsed).toISOString() : "Never",
-      errorMessage: info.errorMessage,
-    };
-  });
-}
 
-// Select the best API key based on least recently used among all Ready keys
-function getBestApiKey(): ApiKeyInfo {
-  const now = Date.now();
+    this.keys = newKeys;
+    console.log(`[ROBIN] Initialized with ${this.keys.length} server API key(s).`);
+  }
 
-  // Reset keys that completed their cooldown (unless Disabled)
-  for (const info of apiKeys) {
-    if (info.status === "Cooling Down" && now >= info.cooldownEnd) {
-      info.status = "Ready";
-      info.cooldownEnd = 0;
-      info.errorMessage = undefined;
+  private refreshStatuses(): void {
+    const now = Date.now();
+    for (const info of this.keys) {
+      if (info.status === "Cooling Down" && now >= info.cooldownEnd) {
+        info.status = "Ready";
+        info.cooldownEnd = 0;
+        info.errorMessage = undefined;
+      }
     }
   }
 
-  // Find all Ready keys
-  const readyKeys = apiKeys.filter((k) => k.status === "Ready");
-  if (readyKeys.length === 0) {
-    if (apiKeys.length === 0) {
-      throw new Error("No Gemini API Keys are configured. Please define GEMINI_API_KEY in Settings > Secrets.");
+  public getNextReadyKey(): ApiKeyInfo | null {
+    this.refreshStatuses();
+    if (this.keys.length === 0) return null;
+
+    const len = this.keys.length;
+    for (let i = 0; i < len; i++) {
+      const idx = (this.rrCursor + i) % len;
+      const candidate = this.keys[idx];
+      if (candidate.status === "Ready") {
+        this.rrCursor = (idx + 1) % len;
+        candidate.lastUsed = Date.now();
+        return candidate;
+      }
     }
-    throw new Error("All configured Gemini API keys are currently Cooling Down or Disabled due to rate-limiting or invalid key errors.");
+    return null;
   }
 
-  // Sort by lastUsed (ascending) for balanced load-distribution (Least Recently Used)
-  readyKeys.sort((a, b) => a.lastUsed - b.lastUsed);
-  const chosen = readyKeys[0];
-  chosen.lastUsed = now;
-  return chosen;
+  public recordError(keyInfo: ApiKeyInfo, errMessage: string): void {
+    keyInfo.failureCount += 1;
+    keyInfo.errorMessage = errMessage;
+    const now = Date.now();
+
+    if (isPermanentKeyError(errMessage)) {
+      keyInfo.status = "Disabled";
+      keyInfo.cooldownEnd = Infinity;
+      console.warn(`[ROBIN] Server key ${keyInfo.name} permanently disabled (invalid key / permission error).`);
+      return;
+    }
+
+    const retryDelay = parseRetryDelayMs(errMessage);
+    if (retryDelay !== null) {
+      keyInfo.status = "Cooling Down";
+      keyInfo.cooldownEnd = now + retryDelay + 2000;
+    } else if (isQuotaError(errMessage)) {
+      keyInfo.status = "Cooling Down";
+      const backoff = Math.min(60000, Math.max(10000, keyInfo.failureCount * 10000));
+      keyInfo.cooldownEnd = now + backoff;
+    } else {
+      keyInfo.status = "Cooling Down";
+      keyInfo.cooldownEnd = now + 10000;
+    }
+    console.warn(`[ROBIN] Server key ${keyInfo.name} cooling down until +${Math.ceil((keyInfo.cooldownEnd - now) / 1000)}s.`);
+  }
+
+  public recordSuccess(keyInfo: ApiKeyInfo): void {
+    keyInfo.status = "Ready";
+    keyInfo.errorMessage = undefined;
+  }
+
+  public getKeysStatusMatrix() {
+    this.refreshStatuses();
+    const now = Date.now();
+    return this.keys.map((info) => {
+      let currentStatus = info.status;
+      let timeRemaining = 0;
+      if (info.status === "Cooling Down") {
+        if (now >= info.cooldownEnd) {
+          currentStatus = "Ready";
+        } else {
+          timeRemaining = Math.ceil((info.cooldownEnd - now) / 1000);
+        }
+      }
+      return {
+        name: info.name,
+        maskedKey: info.key ? `${info.key.slice(0, 4)}...${info.key.slice(-4)}` : "None",
+        status: currentStatus,
+        timeRemaining,
+        failureCount: info.failureCount,
+        lastUsed: info.lastUsed ? new Date(info.lastUsed).toISOString() : "Never",
+        errorMessage: info.errorMessage,
+      };
+    });
+  }
+
+  public getKeysCount(): number {
+    return this.keys.length;
+  }
 }
 
-// Mark server key as cooling down or disabled
-function markKeyCooldown(info: ApiKeyInfo, errMessage: string) {
-  info.failureCount += 1;
-  info.errorMessage = errMessage;
-
-  if (isPermanentKeyError(errMessage)) {
-    info.status = "Disabled";
-    info.cooldownEnd = Infinity;
-    return;
-  }
-
-  const retryDelay = parseRetryDelayMs(errMessage);
-  if (retryDelay !== null) {
-    info.status = "Cooling Down";
-    info.cooldownEnd = Date.now() + retryDelay + 5000;
-  } else if (isQuotaError(errMessage)) {
-    info.status = "Cooling Down";
-    info.cooldownEnd = Date.now() + 15000;
-  } else {
-    info.status = "Cooling Down";
-    info.cooldownEnd = Date.now() + 2 * 60 * 1000;
-  }
-}
-
-// Shared cooldown for custom API keys
-function getCustomKeyCooldown(key: string): number {
-  const until = customKeysCooldownMap.get(key) || 0;
-  const now = Date.now();
-  return until > now ? until - now : 0;
-}
-
-function markCustomKeyCooldown(key: string, errMessage: string) {
-  if (isPermanentKeyError(errMessage)) {
-    customKeysCooldownMap.set(key, Date.now() + 24 * 60 * 60 * 1000); // 24h
-    return;
-  }
-  const retryDelay = parseRetryDelayMs(errMessage);
-  if (retryDelay !== null) {
-    customKeysCooldownMap.set(key, Date.now() + retryDelay + 5000);
-  } else if (isQuotaError(errMessage)) {
-    customKeysCooldownMap.set(key, Date.now() + 15000);
-  } else {
-    customKeysCooldownMap.set(key, Date.now() + 60000);
-  }
-}
+const robinServerManager = new RobinKeyManager();
+robinServerManager.initializeFromEnv();
 
 // ==========================================
 // Spintax Helper: Parser/Resolver for Previews
@@ -290,73 +354,41 @@ function buildSystemInstruction(protectedKeywords: string[], fileType: string): 
   return `You are an expert SEO Content Writer and AI Spintax Specialist.
 Your task is to convert the provided paragraph of text into high-quality, human-friendly Contextual Spintax.
 
-### Core Rules:
-1. FORMAT: Use standard spintax format \`{variation1|variation2|...}\`. Never produce nested spintax (a \`{...}\` block inside another \`{...}\` block). Each spintax block must contain plain text options only.
-2. CONTEXTUAL REWRITE: Do NOT perform simple word-by-word synonym replacement. Rewrite complete sentences or logical phrases so the output reads naturally, flows elegantly, and is highly engaging for humans.
-3. SMART VARIATION: Automatically decide the number of variations (minimum 2 variations per block, 3 for medium complexity, 4 for high complexity). Never generate 0 or 1 variation.
-4. PRESERVE MEANING: Keep the original meaning, facts, names, numbers, and important information exactly. Do not add or remove facts, or change context.
-5. KEYWORD PROTECTION:
+### ATURAN KERAS (wajib dipatuhi tanpa pengecualian):
+
+HARD RULE 1 — HUMAN-READABLE: Every resolved version of the output (any combination of chosen options) must read as natural, fluent, human-friendly text. Never produce awkward, robotic, or grammatically broken sentences just to create variation.
+
+HARD RULE 2 — FULL COVERAGE: Every single sentence in the input, without exception, must be converted into a spintax block. This applies equally to long paragraphs, short paragraphs, single-sentence paragraphs, CTAs, contact/closing lines, and list-style statements. Returning any sentence as plain, unspun text is NEVER allowed, regardless of how short or simple it is.
+
+HARD RULE 3 — SENTENCE-LEVEL GRANULARITY ONLY: The unit of spintax is the FULL SENTENCE, never a single word and never a sub-sentence phrase/clause. For every sentence in the input:
+   - Produce exactly ONE spintax block per sentence: \`{variasi kalimat 1|variasi kalimat 2|variasi kalimat 3}\`.
+   - Each option inside the block must be a complete, independently readable rewrite of that whole sentence (not a word, not a synonym swap, not a partial clause).
+   - Each block must contain 2 to 3 sentence-level variations. Do not go below 2 or above 3.
+   - Do NOT split one sentence into multiple smaller spintax blocks. Do NOT wrap only part of a sentence (e.g. just the opening clause) while leaving the rest of that same sentence unspun outside the block — the entire sentence's text must live inside the single block's options.
+   - Do NOT perform word-by-word synonym replacement. Each option is a full alternative phrasing of the entire sentence, natural and elegant to read.
+
+### Aturan Pendukung:
+A. FORMAT: Use standard spintax format \`{option1|option2|option3}\`. Never produce nested spintax (a \`{...}\` block inside another \`{...}\` block).
+B. PRESERVE MEANING: Keep the original meaning, facts, names, numbers, and important information exactly. Do not add or remove facts, or change context.
+C. KEYWORD PROTECTION:
    The following keywords are strictly protected: [${keywordsString}]
-   These protected keywords MUST remain exactly as-is. Do NOT translate them, do NOT replace them with synonyms, do NOT change their spelling, casing, or word order.
-   ADDITIONAL RULE: Protected keywords must NEVER be placed as one of multiple options inside a {option1|option2} spin block alongside a synonym or alternative phrasing. They must appear as fixed, unspun plain text at their original position, identical across every possible resolution of the spintax.
-6. NO AI-STYLE PUNCTUATION: Never use the em dash (—) or en dash (–) to connect clauses. Rewrite using a comma, period, colon, or a natural connecting word instead. This applies to every variation inside every spintax block.
-7. MANDATORY SPINTAX COVERAGE: Every paragraph/chunk you receive MUST be converted into spintax. Do not return any paragraph as plain, unspun text. Minimum 2 variations per spintax block, even for short or simple sentences, even when the paragraph contains technical terminology or product lists — vary the surrounding sentence structure while keeping technical terms fixed inside each option.
-8. HTML/MARKDOWN PROTECTION (Input Type: ${fileType}):
-   - If the input contains HTML tags (e.g. <h1>, <strong>, <a>, <img ...>, etc.) or Markdown syntax (e.g. #, **, *, [text](url), etc.), you MUST preserve all tags, attributes, and syntax symbols exactly.
-   - Only spin the text inside the HTML elements or Markdown structures. Do NOT spin or alter the tag tags themselves, tag attributes (like href, src, etc.), or Markdown syntax symbols.
-9. PARAGRAPH STRUCTURE: Return the entire paragraph with the spintax embedded, keeping the original paragraph structure intact. Do not add extra comments, markdown formatting around the output, or explanations. Only return the processed text.
-10. CROSS-BLOCK CONSISTENCY CHECK: When a sentence contains two or more spintax blocks close to each other (separated only by a few connecting words, e.g. "atau", "maupun", "dan", "serta"), you MUST mentally resolve at least 3 different combinations of those nearby blocks before finalizing, and verify that no combination produces a repeated noun or repeated key phrase.
-   BAD EXAMPLE (do not do this): block A = "{di setiap rumah sakit|di berbagai klinik}" followed by block B = "{atau klinik yang baru dibangun|maupun rumah sakit yang baru berdiri}" — this can resolve to "di setiap rumah sakit ... maupun rumah sakit yang baru berdiri", repeating "rumah sakit" twice.
-   FIX: either merge the two blocks into a single block with pre-paired, non-redundant options (e.g. "{rumah sakit atau klinik yang baru dibangun|klinik atau rumah sakit yang baru berdiri}"), or make the second block's options generic enough that they don't repeat any noun that could already appear in the first block (e.g. use "yang baru saja rampung dibangun" instead of naming the facility type again).
-11. RHETORICAL VARIETY: Do not rely on the same contrastive sentence pattern (e.g. "bukan X, melainkan Y" / "bukan sekadar X, tapi Y") more than ONCE within a single chunk you are processing. If the source paragraph naturally has multiple contrastive ideas, vary the construction across additive ("selain itu"), causal ("karena itu"), sequential ("setelah itu"), or plain declarative sentences instead of repeating the same contrast template.
-12. OPTION LENGTH BALANCE: Within a single spintax block, keep the word count of the longest option no more than roughly 1.8x the word count of the shortest option. If one natural phrasing is much shorter or longer than the others, rephrase it to a comparable length rather than leaving a large mismatch.
-13. SUBJECT VARIATION: If the source text repeatedly uses the first-person plural pronoun ("kami"/"we") as the sentence subject, vary it occasionally across spintax options within a block — e.g. alternate between "kami", the company name, "tim kami", or a passive construction — as long as meaning and protected keywords are preserved. Do not force this if it makes the sentence unnatural.
-14. SHORT PARAGRAPH ENFORCEMENT: Rule 7 (mandatory spintax coverage) applies with EQUAL strictness to short paragraphs, single-sentence paragraphs, calls-to-action, contact/closing blocks, and short list-style statements (e.g. a single company-value sentence). Being short is NEVER a valid reason to return plain unspun text. For a short paragraph, at minimum wrap the opening clause into a 2-3 option spintax block, and where natural, wrap a second clause as well (e.g. the closing phrase or a key adjective). Treat a 1-2 sentence CTA or contact paragraph exactly the same as a long paragraph for this rule.`;
+   These protected keywords MUST remain exactly as-is in every option of every block. Do NOT translate them, do NOT replace them with synonyms, do NOT change their spelling, casing, or word order.
+   Protected keywords must NEVER appear as one of multiple options inside a spin block alongside a synonym or alternative phrasing — they must appear identically across every option of the sentence's block.
+D. NO AI-STYLE PUNCTUATION: Never use the em dash (—) or en dash (–) to connect clauses. Rewrite using a comma, period, colon, or a natural connecting word instead. This applies to every option inside every block.
+E. HTML/MARKDOWN PROTECTION (Input Type: ${fileType}):
+   - If the input contains HTML tags (e.g. <h1>, <strong>, <a>, <img ...>, etc.) or Markdown syntax (e.g. #, **, *, [text](url), etc.), you MUST preserve all tags, attributes, and syntax symbols exactly, outside the spun sentence text.
+   - Only spin the sentence text itself. Do NOT spin or alter the tags, tag attributes (like href, src, etc.), or Markdown syntax symbols.
+F. PARAGRAPH STRUCTURE: Return the entire paragraph with the spintax embedded, keeping the original paragraph structure and sentence order intact. Do not add extra comments, markdown formatting around the output, or explanations. Only return the processed text.
+G. RHETORICAL VARIETY: Do not rely on the same contrastive sentence pattern (e.g. "bukan X, melainkan Y" / "bukan sekadar X, tapi Y") for more than one sentence's block within a single paragraph you are processing. Vary constructions across additive ("selain itu"), causal ("karena itu"), sequential ("setelah itu"), or plain declarative sentences instead.
+H. OPTION LENGTH BALANCE: Within a single spintax block, keep the word count of the longest option no more than roughly 1.8x the word count of the shortest option.
+I. SUBJECT VARIATION: If the source text repeatedly uses the first-person plural pronoun ("kami"/"we") as the sentence subject, vary it occasionally across options within a block — e.g. alternate between "kami", the company name, "tim kami", or a passive construction — as long as meaning and protected keywords are preserved. Do not force this if it makes the sentence unnatural.`;
 }
 
 // ------------------------------------------
 // Detailed Code-Level Quality Checkers
 // ------------------------------------------
 
-// Checker 1: Detect potential noun collisions in adjacent blocks
-function checkAdjacentBlockRedundancy(text: string, samples = 5): string[] {
-  const issues: string[] = [];
-  const blockRegex = /\{([^{}]+)\}/g;
-  const blocks: { start: number; end: number; options: string[] }[] = [];
-  let m: RegExpExecArray | null;
-
-  while ((m = blockRegex.exec(text)) !== null) {
-    const rawOpts = m[1].split("|").map((o) => o.trim()).filter((o) => o.length > 0);
-    if (rawOpts.length > 0) {
-      blocks.push({ start: m.index, end: m.index + m[0].length, options: rawOpts });
-    }
-  }
-
-  for (let i = 0; i < blocks.length - 1; i++) {
-    const gap = text.slice(blocks[i].end, blocks[i + 1].start);
-    if (gap.length > 25) continue; // Skip if blocks are far apart
-
-    for (let s = 0; s < samples; s++) {
-      const optA = blocks[i].options[Math.floor(Math.random() * blocks[i].options.length)];
-      const optB = blocks[i + 1].options[Math.floor(Math.random() * blocks[i + 1].options.length)];
-
-      const wordsA = optA.toLowerCase().match(/[a-zà-ú]{4,}/g) || [];
-      const wordsBSet = new Set(optB.toLowerCase().match(/[a-zà-ú]{4,}/g) || []);
-
-      const repeated = wordsA.filter((w) => wordsBSet.has(w));
-      if (repeated.length > 0) {
-        issues.push(
-          `Potensi pengulangan kata "${repeated.join(", ")}" jika blok berdekatan dipilih bersamaan: "${optA}" + "${gap}" + "${optB}".`
-        );
-        break; // Max 1 report per adjacent pair
-      }
-    }
-  }
-
-  return issues;
-}
-
-// Checker 2: Detect duplicate options within a single block
+// Checker 1: Detect duplicate options within a single block
 function checkDuplicateOptions(text: string): string[] {
   const issues: string[] = [];
   const blockRegex = /\{([^{}]+)\}/g;
@@ -457,13 +489,12 @@ function validateSpintaxOutput(
     }
   }
 
-  // 5. Code-Level Quality Checkers (Adjacent redundancy, Duplicates, Imbalance, Rhetorical overuse)
-  const adjacentIssues = checkAdjacentBlockRedundancy(output);
+  // 5. Code-Level Quality Checkers (Duplicates, Imbalance, Rhetorical overuse)
   const dupIssues = checkDuplicateOptions(output);
   const lenIssues = checkOptionLengthBalance(output);
   const rhetoricalIssues = checkRhetoricalOveruse(output);
 
-  issues.push(...adjacentIssues, ...dupIssues, ...lenIssues, ...rhetoricalIssues);
+  issues.push(...dupIssues, ...lenIssues, ...rhetoricalIssues);
 
   return {
     ok: issues.length === 0,
@@ -627,7 +658,6 @@ async function executeWithValidationAndRetry(
   autoPatched: boolean;
   criticalUnresolved: boolean;
 }> {
-  const tokenBudget = Math.min(16384, Math.max(2048, paragraphText.length * 6));
   const promptContents = styleNote
     ? `"""\n${paragraphText}\n"""${styleNote}`
     : `"""\n${paragraphText}\n"""`;
@@ -639,7 +669,6 @@ async function executeWithValidationAndRetry(
     config: {
       systemInstruction: systemInstruction,
       temperature: 0.7,
-      maxOutputTokens: tokenBudget,
       thinkingConfig: {
         thinkingLevel: ThinkingLevel.MEDIUM,
       },
@@ -684,7 +713,6 @@ async function executeWithValidationAndRetry(
         config: {
           systemInstruction: systemInstruction,
           temperature: isFinalAttempt ? 0.4 : 0.7,
-          maxOutputTokens: tokenBudget,
           thinkingConfig: {
             thinkingLevel: ThinkingLevel.MEDIUM,
           },
@@ -729,7 +757,7 @@ async function executeWithValidationAndRetry(
 }
 
 // ==========================================
-// Gemini API Generator with Failover
+// Gemini API Generator with Robin Failover
 // ==========================================
 async function generateSpintaxWithFailover(
   paragraphText: string,
@@ -748,7 +776,7 @@ async function generateSpintaxWithFailover(
   const model = process.env.GEMINI_MODEL || "gemini-flash-latest";
   const systemInstruction = buildSystemInstruction(protectedKeywords, fileType);
 
-  // If custom API keys are provided, perform round-robin rotation & failover among them
+  // If custom API keys are provided, perform Robin round-robin rotation & failover among them
   if (customApiKeys && customApiKeys.length > 0) {
     const activeKeys = customApiKeys.map(k => k.trim()).filter(k => k.length > 0);
     if (activeKeys.length > 0) {
@@ -759,25 +787,20 @@ async function generateSpintaxWithFailover(
       while (attempt < maxAttempts) {
         const keyIdx = (initialKeyIndex + attempt) % activeKeys.length;
         const currentKey = activeKeys[keyIdx];
-        const maskedKey = `${currentKey.slice(0, 4)}...${currentKey.slice(-4)}`;
+        const keyState = getCustomKeyState(currentKey);
 
-        // Check shared cooldown state for custom keys
-        const cdRemaining = getCustomKeyCooldown(currentKey);
-        if (cdRemaining > 0) {
-          if (cdRemaining <= 15000) {
-            await sleep(cdRemaining);
-          } else {
-            console.warn(`Custom API Key index ${keyIdx} is in cooldown for ${Math.ceil(cdRemaining/1000)}s. Trying next key.`);
-            attempt++;
-            continue;
-          }
+        if (keyState.status === "Disabled" || keyState.status === "Cooling Down") {
+          console.warn(`[ROBIN-CUSTOM] Key ${keyIdx + 1} (${keyState.maskedKey}) is ${keyState.status}. Failing over to next key immediately.`);
+          attempt++;
+          continue;
         }
 
+        keyState.lastUsed = Date.now();
         const startTime = Date.now();
 
         try {
           const ai = new GoogleGenAI({
-            apiKey: currentKey,
+            apiKey: keyState.key,
             httpOptions: {
               headers: {
                 "User-Agent": "aistudio-build",
@@ -795,12 +818,13 @@ async function generateSpintaxWithFailover(
             styleNote
           );
 
+          recordCustomKeySuccess(keyState);
           const duration = Date.now() - startTime;
 
           debugLogs.push({
             time: new Date().toISOString(),
             apiKeyName: `KUNCI_PRIBADI_${keyIdx + 1}`,
-            maskedKey,
+            maskedKey: keyState.maskedKey,
             model,
             durationMs: duration,
             status: "Success",
@@ -819,12 +843,12 @@ async function generateSpintaxWithFailover(
           const duration = Date.now() - startTime;
           const errMsg = err.message || "Unknown Gemini API Error";
 
-          markCustomKeyCooldown(currentKey, errMsg);
+          recordCustomKeyError(keyState, errMsg);
 
           debugLogs.push({
             time: new Date().toISOString(),
             apiKeyName: `KUNCI_PRIBADI_${keyIdx + 1}`,
-            maskedKey,
+            maskedKey: keyState.maskedKey,
             model,
             durationMs: duration,
             status: "Failover",
@@ -832,30 +856,28 @@ async function generateSpintaxWithFailover(
             attempt: attempt + 1,
           });
 
-          const retryDelay = parseRetryDelayMs(errMsg);
-          if (retryDelay && retryDelay <= 30000) {
-            await sleep(Math.min(retryDelay, 30000));
-          }
-
-          console.warn(`Private API Key index ${keyIdx} failed (Attempt ${attempt + 1}). Error: ${errMsg}. Trying next private key.`);
+          console.warn(`[ROBIN-CUSTOM] Private API Key ${keyIdx + 1} failed. Error: ${errMsg}. Failing over to next key.`);
           attempt++;
         }
       }
-      throw new Error(`Semua ${maxAttempts} Kunci API Pribadi Anda gagal atau terkena rate limit.`);
+      throw new Error(`Semua ${maxAttempts} Kunci API Pribadi Anda gagal, disabled, atau sedang Cooling Down.`);
     }
   }
 
-  // Default server API keys flow
-  const maxAttempts = Math.max(1, apiKeys.length);
+  // Default server API keys flow managed by RobinKeyManager
+  const serverKeyCount = robinServerManager.getKeysCount();
+  if (serverKeyCount === 0) {
+    throw new Error("No Gemini API Keys are configured. Please define GEMINI_API_KEY in Settings > Secrets.");
+  }
+
   let attempt = 0;
+  const maxAttempts = serverKeyCount;
   const debugLogs: any[] = [];
 
   while (attempt < maxAttempts) {
-    let keyInfo: ApiKeyInfo;
-    try {
-      keyInfo = getBestApiKey();
-    } catch (err: any) {
-      throw new Error(`Failed to find an available API key: ${err.message}`);
+    const keyInfo = robinServerManager.getNextReadyKey();
+    if (!keyInfo) {
+      throw new Error("All configured Gemini API keys are currently Cooling Down or Disabled due to rate limits or invalid key errors.");
     }
 
     const startTime = Date.now();
@@ -880,12 +902,13 @@ async function generateSpintaxWithFailover(
         styleNote
       );
 
+      robinServerManager.recordSuccess(keyInfo);
       const duration = Date.now() - startTime;
 
       debugLogs.push({
         time: new Date().toISOString(),
         apiKeyName: keyInfo.name,
-        maskedKey: keyInfo.key ? `****${keyInfo.key.slice(-4)}` : "None",
+        maskedKey: keyInfo.key ? `${keyInfo.key.slice(0, 4)}...${keyInfo.key.slice(-4)}` : "None",
         model,
         durationMs: duration,
         status: "Success",
@@ -904,12 +927,12 @@ async function generateSpintaxWithFailover(
       const duration = Date.now() - startTime;
       const errMsg = err.message || "Unknown Gemini API Error";
 
-      markKeyCooldown(keyInfo, errMsg);
+      robinServerManager.recordError(keyInfo, errMsg);
 
       debugLogs.push({
         time: new Date().toISOString(),
         apiKeyName: keyInfo.name,
-        maskedKey: keyInfo.key ? `****${keyInfo.key.slice(-4)}` : "None",
+        maskedKey: keyInfo.key ? `${keyInfo.key.slice(0, 4)}...${keyInfo.key.slice(-4)}` : "None",
         model,
         durationMs: duration,
         status: "Failover",
@@ -917,7 +940,7 @@ async function generateSpintaxWithFailover(
         attempt: attempt + 1,
       });
 
-      console.warn(`API Key ${keyInfo.name} failed (Attempt ${attempt + 1}). Error: ${errMsg}. Moving to cooldown and trying next key.`);
+      console.warn(`[ROBIN] Server API Key ${keyInfo.name} failed (Attempt ${attempt + 1}). Error: ${errMsg}. Failing over to next key.`);
       attempt++;
     }
   }
@@ -932,25 +955,9 @@ async function generateSpintaxWithFailover(
 // Get Health Check Status of API Keys
 app.get("/api/keys-health", (req, res) => {
   try {
-    let hasChanged = false;
-    
-    if (process.env.GEMINI_API_KEY && !apiKeys.some(k => k.name === "GEMINI_API_KEY")) {
-      hasChanged = true;
-    }
-    for (const envName in process.env) {
-      if (envName.startsWith("GEMINI_API_KEY_") && process.env[envName] && !apiKeys.some(k => k.name === envName)) {
-        hasChanged = true;
-      }
-    }
-
-    if (hasChanged) {
-      console.log("[VERCEL DIAGNOSTIC] Keys change detected on the fly, re-initializing...");
-      initializeApiKeys();
-    }
-
     res.json({
       status: "ok",
-      keys: getKeysStatusMatrix(),
+      keys: robinServerManager.getKeysStatusMatrix(),
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -960,10 +967,10 @@ app.get("/api/keys-health", (req, res) => {
 // Force refresh/reload keys
 app.post("/api/keys-refresh", (req, res) => {
   try {
-    initializeApiKeys();
+    robinServerManager.initializeFromEnv();
     res.json({
       status: "refreshed",
-      keys: getKeysStatusMatrix(),
+      keys: robinServerManager.getKeysStatusMatrix(),
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -1016,7 +1023,7 @@ app.post("/api/generate-spintax", async (req, res) => {
   const processedChunks: string[] = [];
   const allValidationIssues: string[] = [];
 
-  const activeKeyCount = resolvedCustomKeys.length > 0 ? resolvedCustomKeys.length : Math.max(1, apiKeys.length);
+  const activeKeyCount = resolvedCustomKeys.length > 0 ? resolvedCustomKeys.length : Math.max(1, robinServerManager.getKeysCount());
   // Cap worker concurrency to Math.min(activeKeyCount, 3) to prevent bursting free-tier API quotas
   const concurrencyLimit = Math.max(1, Math.min(activeKeyCount, 3));
 
@@ -1138,7 +1145,7 @@ app.post("/api/generate-spintax", async (req, res) => {
     previews,
     durationMs: totalDuration,
     debugLogs: allLogs,
-    keysHealth: getKeysStatusMatrix(),
+    keysHealth: robinServerManager.getKeysStatusMatrix(),
     partialFailures,
     validationIssues: allValidationIssues,
     autoPatchedChunks,
