@@ -246,6 +246,41 @@ function sanitizeSpintaxText(text: string): string {
   return cleaned;
 }
 
+// Document-level rolling style memory tracker
+interface StyleMemory {
+  rhetoricalPatternCount: number;
+  kamiCount: number;
+  totalWordCount: number;
+}
+
+function buildStyleMemoryNote(memory: StyleMemory): string {
+  if (memory.totalWordCount < 50) return "";
+  const kamiDensity = memory.totalWordCount > 0 ? memory.kamiCount / memory.totalWordCount : 0;
+  const notes: string[] = [];
+
+  if (memory.rhetoricalPatternCount >= 1) {
+    notes.push("Pola kontras 'bukan X, melainkan Y' / 'bukan sekadar' sudah pernah dipakai di paragraf sebelumnya. Hindari memakainya lagi di paragraf ini, gunakan konstruksi lain (seperti 'selain itu', 'karena itu', atau kalimat deklaratif biasa).");
+  }
+
+  if (kamiDensity > 0.03) {
+    notes.push("Kata 'kami' sudah cukup padat dipakai di paragraf sebelumnya. Kurangi frekuensinya di paragraf ini, variasikan dengan nama perusahaan, 'tim kami', atau kalimat pasif.");
+  }
+
+  if (notes.length === 0) return "";
+  return "\n\nCATATAN GAYA DOKUMEN (dari paragraf-paragraf sebelumnya, agar tidak monoton):\n- " + notes.join("\n- ");
+}
+
+function updateStyleMemory(memory: StyleMemory, text: string) {
+  const words = text.split(/\s+/).filter(Boolean);
+  memory.totalWordCount += words.length;
+
+  const rhetoricalMatches = (text.match(/bukan\s+(?:sekadar|hanya|cuma)|melainkan/gi) || []).length;
+  memory.rhetoricalPatternCount += rhetoricalMatches;
+
+  const kamiMatches = (text.match(/\bkami\b/gi) || []).length;
+  memory.kamiCount += kamiMatches;
+}
+
 // ==========================================
 // System Instruction & Validation Helpers
 // ==========================================
@@ -269,7 +304,109 @@ Your task is to convert the provided paragraph of text into high-quality, human-
 8. HTML/MARKDOWN PROTECTION (Input Type: ${fileType}):
    - If the input contains HTML tags (e.g. <h1>, <strong>, <a>, <img ...>, etc.) or Markdown syntax (e.g. #, **, *, [text](url), etc.), you MUST preserve all tags, attributes, and syntax symbols exactly.
    - Only spin the text inside the HTML elements or Markdown structures. Do NOT spin or alter the tag tags themselves, tag attributes (like href, src, etc.), or Markdown syntax symbols.
-9. PARAGRAPH STRUCTURE: Return the entire paragraph with the spintax embedded, keeping the original paragraph structure intact. Do not add extra comments, markdown formatting around the output, or explanations. Only return the processed text.`;
+9. PARAGRAPH STRUCTURE: Return the entire paragraph with the spintax embedded, keeping the original paragraph structure intact. Do not add extra comments, markdown formatting around the output, or explanations. Only return the processed text.
+10. CROSS-BLOCK CONSISTENCY CHECK: When a sentence contains two or more spintax blocks close to each other (separated only by a few connecting words, e.g. "atau", "maupun", "dan", "serta"), you MUST mentally resolve at least 3 different combinations of those nearby blocks before finalizing, and verify that no combination produces a repeated noun or repeated key phrase.
+   BAD EXAMPLE (do not do this): block A = "{di setiap rumah sakit|di berbagai klinik}" followed by block B = "{atau klinik yang baru dibangun|maupun rumah sakit yang baru berdiri}" — this can resolve to "di setiap rumah sakit ... maupun rumah sakit yang baru berdiri", repeating "rumah sakit" twice.
+   FIX: either merge the two blocks into a single block with pre-paired, non-redundant options (e.g. "{rumah sakit atau klinik yang baru dibangun|klinik atau rumah sakit yang baru berdiri}"), or make the second block's options generic enough that they don't repeat any noun that could already appear in the first block (e.g. use "yang baru saja rampung dibangun" instead of naming the facility type again).
+11. RHETORICAL VARIETY: Do not rely on the same contrastive sentence pattern (e.g. "bukan X, melainkan Y" / "bukan sekadar X, tapi Y") more than ONCE within a single chunk you are processing. If the source paragraph naturally has multiple contrastive ideas, vary the construction across additive ("selain itu"), causal ("karena itu"), sequential ("setelah itu"), or plain declarative sentences instead of repeating the same contrast template.
+12. OPTION LENGTH BALANCE: Within a single spintax block, keep the word count of the longest option no more than roughly 1.8x the word count of the shortest option. If one natural phrasing is much shorter or longer than the others, rephrase it to a comparable length rather than leaving a large mismatch.
+13. SUBJECT VARIATION: If the source text repeatedly uses the first-person plural pronoun ("kami"/"we") as the sentence subject, vary it occasionally across spintax options within a block — e.g. alternate between "kami", the company name, "tim kami", or a passive construction — as long as meaning and protected keywords are preserved. Do not force this if it makes the sentence unnatural.`;
+}
+
+// ------------------------------------------
+// Detailed Code-Level Quality Checkers
+// ------------------------------------------
+
+// Checker 1: Detect potential noun collisions in adjacent blocks
+function checkAdjacentBlockRedundancy(text: string, samples = 5): string[] {
+  const issues: string[] = [];
+  const blockRegex = /\{([^{}]+)\}/g;
+  const blocks: { start: number; end: number; options: string[] }[] = [];
+  let m: RegExpExecArray | null;
+
+  while ((m = blockRegex.exec(text)) !== null) {
+    const rawOpts = m[1].split("|").map((o) => o.trim()).filter((o) => o.length > 0);
+    if (rawOpts.length > 0) {
+      blocks.push({ start: m.index, end: m.index + m[0].length, options: rawOpts });
+    }
+  }
+
+  for (let i = 0; i < blocks.length - 1; i++) {
+    const gap = text.slice(blocks[i].end, blocks[i + 1].start);
+    if (gap.length > 25) continue; // Skip if blocks are far apart
+
+    for (let s = 0; s < samples; s++) {
+      const optA = blocks[i].options[Math.floor(Math.random() * blocks[i].options.length)];
+      const optB = blocks[i + 1].options[Math.floor(Math.random() * blocks[i + 1].options.length)];
+
+      const wordsA = optA.toLowerCase().match(/[a-zà-ú]{4,}/g) || [];
+      const wordsBSet = new Set(optB.toLowerCase().match(/[a-zà-ú]{4,}/g) || []);
+
+      const repeated = wordsA.filter((w) => wordsBSet.has(w));
+      if (repeated.length > 0) {
+        issues.push(
+          `Potensi pengulangan kata "${repeated.join(", ")}" jika blok berdekatan dipilih bersamaan: "${optA}" + "${gap}" + "${optB}".`
+        );
+        break; // Max 1 report per adjacent pair
+      }
+    }
+  }
+
+  return issues;
+}
+
+// Checker 2: Detect duplicate options within a single block
+function checkDuplicateOptions(text: string): string[] {
+  const issues: string[] = [];
+  const blockRegex = /\{([^{}]+)\}/g;
+  let m: RegExpExecArray | null;
+
+  while ((m = blockRegex.exec(text)) !== null) {
+    const opts = m[1].split("|").map((o) => o.trim().toLowerCase()).filter((o) => o.length > 0);
+    const unique = new Set(opts);
+    if (unique.size < opts.length) {
+      issues.push(`Blok spintax mengandung opsi duplikat: "{${m[1]}}"`);
+    }
+  }
+
+  return issues;
+}
+
+// Checker 3: Detect option length imbalance (> 2.2x ratio)
+function checkOptionLengthBalance(text: string, maxRatio = 2.2): string[] {
+  const issues: string[] = [];
+  const blockRegex = /\{([^{}]+)\}/g;
+  let m: RegExpExecArray | null;
+
+  while ((m = blockRegex.exec(text)) !== null) {
+    const opts = m[1].split("|").map((o) => o.trim()).filter((o) => o.length > 0);
+    const counts = opts.map((o) => o.split(/\s+/).filter(Boolean).length).filter((c) => c > 0);
+    if (counts.length < 2) continue;
+
+    const minLen = Math.min(...counts);
+    const maxLen = Math.max(...counts);
+
+    if (minLen > 0 && maxLen / minLen > maxRatio) {
+      const ratio = (maxLen / minLen).toFixed(1);
+      issues.push(`Blok spintax punya opsi dengan rasio panjang ${ratio}x: "{${m[1]}}"`);
+    }
+  }
+
+  return issues;
+}
+
+// Checker 4: Detect rhetorical overuse in a single chunk
+function checkRhetoricalOveruse(text: string): string[] {
+  const markers = ["bukan sekadar", "bukan hanya", "melainkan"];
+  let count = 0;
+  for (const marker of markers) {
+    const regex = new RegExp(marker, "gi");
+    count += (text.match(regex) || []).length;
+  }
+  if (count > 1) {
+    return [`Pola kontras "bukan/melainkan" muncul ${count}x dalam satu chunk, sebaiknya maksimal 1x.`];
+  }
+  return [];
 }
 
 // Post-generation validation
@@ -318,6 +455,14 @@ function validateSpintaxOutput(
       }
     }
   }
+
+  // 5. Code-Level Quality Checkers (Adjacent redundancy, Duplicates, Imbalance, Rhetorical overuse)
+  const adjacentIssues = checkAdjacentBlockRedundancy(output);
+  const dupIssues = checkDuplicateOptions(output);
+  const lenIssues = checkOptionLengthBalance(output);
+  const rhetoricalIssues = checkRhetoricalOveruse(output);
+
+  issues.push(...adjacentIssues, ...dupIssues, ...lenIssues, ...rhetoricalIssues);
 
   return {
     ok: issues.length === 0,
@@ -429,19 +574,24 @@ async function executeWithValidationAndRetry(
   paragraphText: string,
   systemInstruction: string,
   protectedKeywords: string[],
-  fileType: string
+  fileType: string,
+  styleNote = ""
 ): Promise<{ spintaxText: string; validationIssues: string[] }> {
   const tokenBudget = Math.min(16384, Math.max(2048, paragraphText.length * 6));
+  const promptContents = styleNote
+    ? `"""\n${paragraphText}\n"""${styleNote}`
+    : `"""\n${paragraphText}\n"""`;
 
+  // Use ThinkingLevel.MEDIUM for the initial pass to allow mental cross-block checks
   const response = await ai.models.generateContent({
     model: model,
-    contents: `"""\n${paragraphText}\n"""`,
+    contents: promptContents,
     config: {
       systemInstruction: systemInstruction,
       temperature: 0.7,
       maxOutputTokens: tokenBudget,
       thinkingConfig: {
-        thinkingLevel: ThinkingLevel.LOW,
+        thinkingLevel: ThinkingLevel.MEDIUM,
       },
     },
   });
@@ -465,11 +615,11 @@ async function executeWithValidationAndRetry(
   spintaxText = sanitizeSpintaxText(spintaxText);
   let validation = validateSpintaxOutput(paragraphText, spintaxText, protectedKeywords, fileType);
 
-  // If validation failed, attempt 1x correction retry with escalated ThinkingLevel.MEDIUM
+  // If validation failed, attempt 1x correction retry
   if (!validation.ok) {
     try {
       console.warn("Spintax validation issues detected. Attempting 1x correction retry:", validation.issues);
-      const correctionPrompt = `"""\n${paragraphText}\n"""\n\nCATATAN PERBAIKAN: Hasil sebelumnya melanggar aturan berikut:\n- ${validation.issues.join("\n- ")}\nTulis ulang dan pastikan SEMUA aturan dipatuhi, terutama poin yang dilanggar ini.`;
+      const correctionPrompt = `${promptContents}\n\nCATATAN PERBAIKAN: Hasil sebelumnya melanggar aturan berikut:\n- ${validation.issues.join("\n- ")}\nTulis ulang dan pastikan SEMUA aturan dipatuhi, terutama poin yang dilanggar ini.`;
 
       const retryResponse = await ai.models.generateContent({
         model: model,
@@ -512,7 +662,8 @@ async function generateSpintaxWithFailover(
   protectedKeywords: string[],
   fileType: string,
   customApiKeys?: string[],
-  initialKeyIndex = 0
+  initialKeyIndex = 0,
+  styleNote = ""
 ): Promise<{ spintaxText: string; debugLogs: any[]; validationIssues: string[] }> {
   const model = process.env.GEMINI_MODEL || "gemini-flash-latest";
   const systemInstruction = buildSystemInstruction(protectedKeywords, fileType);
@@ -560,7 +711,8 @@ async function generateSpintaxWithFailover(
             paragraphText,
             systemInstruction,
             protectedKeywords,
-            fileType
+            fileType,
+            styleNote
           );
 
           const duration = Date.now() - startTime;
@@ -642,7 +794,8 @@ async function generateSpintaxWithFailover(
         paragraphText,
         systemInstruction,
         protectedKeywords,
-        fileType
+        fileType,
+        styleNote
       );
 
       const duration = Date.now() - startTime;
@@ -781,6 +934,13 @@ app.post("/api/generate-spintax", async (req, res) => {
   // Cap worker concurrency to Math.min(activeKeyCount, 3) to prevent bursting free-tier API quotas
   const concurrencyLimit = Math.max(1, Math.min(activeKeyCount, 3));
 
+  // Style Memory instance across chunks in this request
+  const sharedStyleMemory: StyleMemory = {
+    rhetoricalPatternCount: 0,
+    kamiCount: 0,
+    totalWordCount: 0,
+  };
+
   const results = await processWithConcurrencyLimit(
     chunks,
     concurrencyLimit,
@@ -788,13 +948,20 @@ app.post("/api/generate-spintax", async (req, res) => {
       if (chunk.length < 5) {
         return { spintaxText: chunk, debugLogs: [], validationIssues: [] };
       }
-      return await generateSpintaxWithFailover(
+      const styleNote = buildStyleMemoryNote(sharedStyleMemory);
+      const res = await generateSpintaxWithFailover(
         chunk,
         formattedKeywords,
         fileType,
         resolvedCustomKeys,
-        index
+        index,
+        styleNote
       );
+
+      // Update shared style memory upon chunk completion
+      updateStyleMemory(sharedStyleMemory, res.spintaxText);
+
+      return res;
     }
   );
 
