@@ -1051,6 +1051,34 @@ app.post("/api/generate-spintax", async (req, res) => {
     }
   );
 
+  // Retry rejected chunks sequentially after a short cooldown pause
+  const rejectedIndices = results
+    .map((res, idx) => (res.status === "rejected" ? idx : -1))
+    .filter((idx) => idx !== -1);
+
+  if (rejectedIndices.length > 0) {
+    console.warn(`${rejectedIndices.length} chunk gagal di percobaan pertama, mencoba ulang secara berurutan...`);
+    await sleep(5000);
+
+    for (const idx of rejectedIndices) {
+      try {
+        const styleNote = buildStyleMemoryNote(sharedStyleMemory);
+        const retryRes = await generateSpintaxWithFailover(
+          chunks[idx],
+          formattedKeywords,
+          fileType,
+          resolvedCustomKeys,
+          idx,
+          styleNote
+        );
+        results[idx] = { status: "fulfilled", value: retryRes };
+        updateStyleMemory(sharedStyleMemory, retryRes.spintaxText);
+      } catch {
+        // Masih gagal, biarkan tetap "rejected" untuk ditangani oleh fallback deterministik
+      }
+    }
+  }
+
   results.forEach((res, index) => {
     if (res.status === "fulfilled") {
       processedChunks.push(res.value.spintaxText);
@@ -1065,13 +1093,20 @@ app.post("/api/generate-spintax", async (req, res) => {
         criticalIssueChunks++;
       }
     } else {
-      // Chunk failed after all retries: use original chunk text as fallback
-      partialFailures++;
-      const originalChunk = chunks[index];
-      processedChunks.push(originalChunk);
-
       const errMsg = res.reason?.message || "Generation failed";
-      console.error(`Chunk ${index + 1} failed:`, errMsg);
+      const rawChunk = chunks[index];
+      const fallback = forceMinimalSpintaxFallback(rawChunk);
+
+      partialFailures++;
+      processedChunks.push(fallback.text);
+
+      if (fallback.patched) {
+        autoPatchedChunks++;
+      } else {
+        criticalIssueChunks++;
+      }
+
+      console.error(`Chunk ${index + 1} gagal setelah semua percobaan:`, errMsg);
 
       allLogs.push({
         time: new Date().toISOString(),
@@ -1080,7 +1115,9 @@ app.post("/api/generate-spintax", async (req, res) => {
         model: process.env.GEMINI_MODEL || "gemini-flash-latest",
         durationMs: 0,
         status: "Failed-Fallback",
-        error: `Paragraf/Chunk ${index + 1} gagal di-spin: ${errMsg}. Teks asli digunakan sebagai fallback.`,
+        error: `Paragraf/Chunk ${index + 1} gagal di-spin: ${errMsg}. ${
+          fallback.patched ? "Fallback minimal spintax diterapkan." : "Teks asli digunakan tanpa modifikasi."
+        }`,
         chunkIndex: index + 1,
       });
     }
